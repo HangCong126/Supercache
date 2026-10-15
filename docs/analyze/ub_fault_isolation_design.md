@@ -5,11 +5,74 @@
 > 结构参考：认证读取的 [yuanrong issue #28](https://gitcode.com/hc147/yuanrong-datasystem/issues/28)；实现对照：同级 yuanrong-datasystem `eacc9857`。
 > 关联：[Jetty 池化与生命周期](ub_jetty_pool_lifecycle_design.md)、[端口故障触发的时延成本调度](ub_load_scheduling_design.md)。本文只设计故障事实、业务准入与恢复，不接管资源池或调度权重。
 
+## 0. yuanrong 与 Supercache 的读写变化及适配原则
+
+### 0.1 角色职责对应
+
+业务仍是写入 key/value、按 key 读取，但这是职责映射，不是把 Worker 类改名为 Store。
+
+| yuanrong 角色 | Supercache 中的对应职责 |
+| --- | --- |
+| Client：发起 GET/SET、选择 Worker、管理发送/接收 buffer | 请求侧 Client：向 Master 查询副本或申请空间，再调用 TE 传输 |
+| Worker：管理对象、内存、业务 RPC，并回写数据 | Master 管对象元数据和分配；提供内存的 Store 进程承载注册内存及数据服务 |
+| Client/Worker 内部 UB 组件 | TE 的 UbTransport / UrmaContext / UrmaEndpoint |
+
+Supercache 源码中的 Client 也可提供存储内存。同一进程可以同时发起 PUT/GET、挂载 segment 供他人读写；`global_segment_size=0` 时可以只做请求客户端。独立 Store 服务也复用 RealClient 实现。因此本文始终区分请求发起角色与数据持有角色，节点隔离按进程身份覆盖其两种角色，而不按 Client 类名判断。参见 [RealClient 初始化](../../mooncake-store/src/real_client.cpp)。
+
+### 0.2 SET/PUT：分配和发布协调发生变化
+
+```text
+yuanrong 典型 UB SET：
+Client 向 Worker 准备对象空间 → Client UB WRITE 到 Worker → Publish RPC 发布
+
+Supercache 内存 PUT：
+Client 向 Master PutStart → Master 返回副本地址
+→ Client TE WRITE 到 Store → 向 Master PutEnd 或 PutRevoke
+```
+
+Supercache 的分配和确认主要与 Master 交互，目标 Store 通常不执行每次 WRITE 对应的对象级 Publish RPC。当前 `Put()` 遇到 OBJECT_ALREADY_EXISTS 返回成功且不覆盖旧值，更新有独立 `Upsert()` 路径；迁移 yuanrong SET 时须按存在性/覆盖语义选择 API。故障 gate 必须同时覆盖 Put/Upsert，而非只拦截一种写入口。
+
+代码对照：[yuanrong UB 写入](../../../yuanrong-datasystem/src/datasystem/client/object_cache/client_worker_api/client_worker_base_api.cpp)、[Supercache Put/Upsert](../../mooncake-store/src/client_service.cpp)。
+
+### 0.3 GET：Worker WRITE 回写变为 Client 主动 READ
+
+```text
+yuanrong 典型 UB GET：
+Client 发 Get/QueryAndGet 并提供 buffer → Worker UB WRITE 回 Client → Worker 返回业务结果
+
+Supercache 远端内存 GET：
+Client 查询 Master 副本 → Client TE READ 远端 Store 到本地
+→ Client 检查传输、校验和与读取 lease
+```
+
+前者由 Worker 提交 WR、处理 CQE，业务响应可携带健康摘要；后者通常由请求侧 Client 的实际 TE 执行者提交 READ、处理 CQE，数据阶段没有对应的对象级 Worker 响应。READ 的数据流是 Store → Client，但“本地”仍指提交 WR、接收 CQE 的一方，不随数据方向翻转。存在 TE 代理时以实际执行进程为准，再向业务调用方映射错误。
+
+以上只描述远端内存 UB 主路径，本地缓存、memcpy、TCP、磁盘和 offload 分支按实际 opcode 判断。当前 Copy/Move 的内存数据阶段由源 Store WRITE 到目标；实际采用 READ 的其他拉取路径另按 READ 处理。
+
+代码对照：[yuanrong Get 回写](../../../yuanrong-datasystem/src/datasystem/worker/object_cache/service/worker_query_and_get_impl.cpp)、[Supercache TransferRead/TransferWrite 与复制](../../mooncake-store/src/client_service.cpp)。
+
+### 0.4 yuanrong 可靠性能力如何适配
+
+| 参考能力 | Supercache 适配方式 |
+| --- | --- |
+| CQE 异常触发端口核验，不直接隔离 | CQE 决定当前操作失败及查询侧；本地 urma_user_ctl 返回事实决定后续隔离 |
+| Client/Worker 本地监控和业务准入 | 每个四端口域一个 Monitor；同域 context 共享事实；进程级 NodeBusinessAdmission 聚合域 |
+| Worker 在 GET 响应携带健康摘要 | Store 独立提供健康 Query，控制通道传播摘要；不依赖不存在的 GET 数据响应 |
+| WorkerRouter/Client 健康过滤 | Master 避让新分配；请求侧 Client 过滤读副本和缓存 descriptor；TE 最终守卫 |
+| Worker 间传输隔离 | 对 Copy/Move 等按实际 WRITE/READ 执行者处理，源/目标都检查准入 |
+| 端口恢复查询 | 故障侧本地持续至 bad=0；远端恢复轮询确认可服务即停止，不把两者混为一个任务 |
+
+### 0.5 本方案固定的底层契约
+
+**CQE 处理当前操作，端口 Query 处理后续准入，两条链分开。端口健康不能把已经失败的读写改成成功。**
+
+`4 LOC_ACCESS_ERR` 对 READ/WRITE 都只触发提交端本地端口核验；`9 ACK_TIMEOUT_ERR` 对 READ/WRITE 都触发提交端与对端各自查询本地 context，不能固定解释为远端故障。查询失败不等于全坏，双方端口都健康则不建立端口隔离，继续按连接/链路及请求错误处理。具体 SDK 状态映射在适配器中校验，不把裸数值扩展到其他 provider。
+
 ## 1. Story 整体设计
 
 ### 1.1 功能描述
 
-形成“异常观测 → 端口核验 → 节点业务隔离 → 健康传播 → 选点过滤 → 核验恢复”的闭环。一个域故障先限制该域；全部配置的数据服务域确认不可用，才关闭节点新数据业务。
+形成“异常观测 → 四端口核验 → 节点业务隔离 → 健康传播 → 选点过滤 → 核验恢复”的闭环。一个域四口全坏先限制该域；全部配置的数据服务域确认不可用，才关闭节点新数据业务。当前失败操作的结果不等待健康查询，更不由查询改写。
 
 #### 影响范围
 
@@ -66,37 +129,46 @@
 | 控制传播 | 普通 Probe 只证明响应，缺少端口查询协议 | 版本化 Query、摘要、完整/增量视图 |
 | 生命周期 | context 故障与 WR/任务责任分散 | 隔离只停止新提交，Jetty/operation owner 负责安全收敛 |
 
-以下 E4/E9 均为参考设计中的错误语义提示，具体映射必须由实际 SDK/provider 与 opcode 确认，不能跨版本解释裸数字。
+以下场景固定采用目标 UB 定义：E4 为 LOC_ACCESS_ERR，E9 为 ACK_TIMEOUT_ERR。READ/WRITE 的查询归属一致，底层数据方向不改变“本地”的定义；端口故障归属仍以各方查询结果为准。
 
-### 2.1 UC-1 发起 Client 故障：PUT 的本地异常
+### 2.1 UC-1 Client PUT：WRITE 收到 E4
 
-Client 执行 WRITE 时得到本地故障线索，触发自身域核验。部分端口坏只关闭坏路径；全部服务域确认不可用才关闭本地 gate。当前 PUT 按实际 post/完成结果结算，后续所有新数据入口拒绝；不因单次错误隔离目标存储节点。
+Client 将当前 WR 标记失败，不报告写入成功，不自动重放可能已部分写入的 WRITE；同时异步触发自身四端口 Monitor。确认四口全坏才关闭该域，全部服务域不可用才关闭本地节点。端口健康时仍保留本次访问错误，检查地址、长度、权限和 segment 生命周期；不因此标坏 Store。
 
-### 2.2 UC-2 发起 Client 故障：GET 的本地异常
+### 2.2 UC-2 Client GET：READ 收到 E4
 
-Client 执行单边 READ 时，读取本地完成记录中的方向和错误类别。本地证据明确则查询自身；归因不明确则核验自身与对端，分别更新视图。不能因为 GET 失败就假定数据提供节点故障；本地隔离后不能通过换源绕过本地 gate。
+本地仍是发起 READ 的 Client。当前 READ 失败，接收内容无效，不交给业务；staging READ 禁止执行成功路径的 H2D。只触发本端端口查询，端口健康不能证明本地注册已恢复。重试须检查注册、范围、lease，并等待关联 WR 安全收敛；本地隔离时不能靠换 Store 绕过。
 
-### 2.3 UC-3 存储节点故障：PUT 的远端异常
+### 2.3 UC-3 Client PUT：WRITE 收到 E9
 
-Client WRITE 出现远端故障线索，对目标发起独立节点 Query。确认目标全部服务域不可用后，Client 排除该目标，Master 核验后停止新的分配。已取得的 PutStart 不能作为后续传输的永久许可；未提交部分走既有 abort，已 post 前缀按真实结果收敛。
+Client 当前 WRITE 失败，但保留远端可能已写入的不确定性；不自动重放到原地址或其他目标。同时启动本地 Monitor，并通过控制 Query 触发 Store 自己查询本地 context。
 
-### 2.4 UC-4 存储节点故障：GET 的远端异常
+谁确认四口全坏就关闭谁的域，各方再按完整服务域集合聚合节点状态。Client 确认 Store 节点隔离后排除它，Master 独立核验后停止新分配。双方有健康端口时不建立端口隔离；远端 RPC 失败也不证明端口全坏。旧 PutStart 不绕过新 gate，未 post 部分进入现有撤销流程，已 post 前缀保留原 owner。
 
-Client READ 失败后按 provider 语义核验 Provider，必要时同时核验自身。确认读源隔离后，从现有策略的健康副本中重选；对象存在但所有副本不可服务时返回节点不可用，不返回对象不存在，不建立负缓存。
+### 2.4 UC-4 Client GET：READ 收到 E9
+
+Client 将本次内容标为无效，同时核验自身与 Store。源 Store 确认隔离时过滤该副本；本地节点也隔离时停止新的 READ。旧操作及关联 WR 安全收敛后，才可在 lease/注册有效且本地准入允许时重新读取或换健康副本，不能让新旧 READ 并发写同一 buffer。
+
+对象存在但全部副本不可服务时返回节点不可用，不返回对象不存在、不建立负缓存。双方端口健康仍不改变当前读取失败的结果。
 
 ### 2.5 UC-5 节点间后台任务与恢复
 
-#### 后台复制、迁移与分层数据阶段
+#### 复制、迁移和实际 READ 路径
 
-按实际 READ/WRITE 的执行方向识别源/目标，不套用 yuanrong RemoteGet 的固定 WRITE 模式。新任务、重试、新窗口和新 grant 均检查双方准入；已 post 的部分由原 operation owner 持有至安全完成。
+| 业务与 opcode | 数据方向 / CQE 接收方 | E4 查询 | E9 查询 |
+| --- | --- | --- | --- |
+| Client PUT / WRITE | Client → Store / Client | Client 自身 | Client、Store 各查自身 |
+| Client GET / READ | Store → Client / Client | Client 自身 | Client、Store 各查自身 |
+| Store A Copy/Move / WRITE | A → B / A | A 自身 | A、B 各查自身 |
+| Store A 实际拉取 / READ | B → A / A | A 自身 | A、B 各查自身 |
 
-#### 多域退化与节点隔离
+Copy/Move 的源隔离则停止新发送，目标隔离则停止新 WR；符合现有策略时才另选健康源。数据阶段成功并完成提交前不改变副本状态，目标写失败不得提前删除源副本。所有新任务、重试、窗口和 grant 检查双方准入，已 post 部分继续由原 owner 收敛。
 
-域 A 全坏而域 B 仍可用时，节点保持 DEGRADED，只使用合法域。只有所有配置域均有有效不可用证据才进入 ISOLATED，不能通过移除故障域制造健康。
+#### 多域退化与恢复
 
-#### 节点间恢复
+一个域四口全坏而另一个域仍可用时保持 DEGRADED。只有全部配置域有效不可用才隔离节点，故障域不能从集合删除。
 
-本地周期核验发现至少一个域可用后发布新 epoch；远端收到摘要只启动 Query，通过后恢复选择。旧实例、旧 ticket 或旧 CQE 不得恢复新实例，也不把退役 Jetty 放回池。
+本地 Monitor 从 bad=4 降为 3/2/1 时立即解除端口隔离，但继续每秒查询至 bad=0；远端消费者经独立 Query 确认节点可服务后解除自己的端口隔离并停止该远端恢复轮询。旧身份、旧 ticket 和旧 CQE 不恢复新实例，端口恢复也不复活退役 Jetty 或清除资源 fatal。
 
 ## 3. 方案详细设计
 
@@ -130,9 +202,9 @@ Store 只消费通用节点摘要，不依赖 URMA 类型；TE 不依赖 Master/
 
 节点身份为 `(client_id, transport_incarnation)`，不是 IP、host_id、HCA 名或 vector index。新实例必须通过 Mount/ReMount 的所有权绑定替换，健康响应不能改写 segment ownership。
 
-初始化固定服务域集合并分配 `service_set_generation`。provider 证明多个 context 共用端口集合时按 `health_domain_id` 去重；否则独立。失败、fatal 或暂不可用域仍保留在集合中；变更集合必须显式更新代际。空集合是 NOT_READY，不能利用空集合全称判断得到 all-bad。
+初始化固定服务域集合并分配 `service_set_generation`。本方案每域预期四端口，需由配置与 provider 确认完整身份集合；多个 context 共享这四口时只建一个域 Monitor，查询使用该域有效的本地 context，生命周期受引用保护。provider 不能证明共享集合时不得误合并。失败、fatal 或暂不可用域仍保留在集合中；变更集合必须显式更新代际。空集合是 NOT_READY，不能利用空集合全称判断得到 all-bad。
 
-端口 all-bad 必须满足：`valid && !verification_pending && total > 0 && bad == total`，且查询覆盖该域最新异常。域不可用来源为已确认端口 all-bad，或经适配器确认的资源 fatal；两种原因分别记录，不能把 fatal 伪装为端口坏。
+端口 all-bad 必须满足：`valid && !verification_pending && expected_total == 4 && total == 4 && bad == 4`，且查询覆盖该域最新异常。域不可用来源为已确认端口 all-bad，或经适配器确认的资源 fatal；两种原因分别记录，不能把 fatal 伪装为端口坏。
 
 节点进入 ISOLATED 的唯一升级条件是：**非空配置服务域集合中，每个域都有覆盖最新异常的有效不可用证据**。单次 CQE、查询失败、普通心跳丢失不能满足该条件。
 
@@ -154,17 +226,34 @@ UNKNOWN 描述证据状态，不能覆盖已确认的 ISOLATED；已建立可用
 
 #### 3.2.3 本地端口健康监控
 
-每域维护一次在途查询，每秒最多发起一次；退化/隔离域按一秒目标周期持续核验直至全 GOOD。CQE/AE 只合并核验请求，不能无限排队。启动先建立身份、域集合和初始事实，再开放准入。
+每个四端口域一个 Monitor，多个 context 的业务异常合并到同一实例。首次异常异步触发核验；同域 single-flight、每秒最多一次。CQE 线程不阻塞调用 urma_user_ctl。启动核验建立初始事实后，全 GOOD 时不持续轮询。
 
-端口键用 `(chip_id, die_id, port_idx)`。校验返回长度、数量、唯一身份和枚举，再重算 total/bad；空结果或解析失败无效。`health_epoch` 表示事实变化，`query_seq` 表示成功新查询，`observation_generation` 表示新异常，三者不能互代。
+| 本次有效查询 | 端口隔离决定 | 本地后续查询 |
+| --- | --- | --- |
+| total=4、bad=4 | 建立/保持该域端口隔离 | 每秒继续 |
+| total=4、bad=1～3 | 立即取消该域端口隔离，进入退化；资源 fatal 另判 | 每秒继续 |
+| total=4、bad=0 | 取消端口隔离，资源在线则健康 | 停止周期查询，后续异常重新触发 |
+| 失败、pending、集合不完整或结果非法 | 保留此前确认状态，不新增/解除端口隔离 | 每秒继续核验 |
 
-删除 monitor 无条件 active 恢复。PORT_DOWN/PORT_ACTIVE 触发核验；资源 fatal 独立关闭路径并请求本地节点聚合，只有适配器确认的资源事实才能参与全域判定。
+预期四口却只返回三口时，即使三口全 GOOD 也不能作为恢复证据。端口键用 `(chip_id, die_id, port_idx)`，排序、判重并核对预期集合，再统计 bad。`health_epoch` 表示事实变化，`query_seq` 表示成功新查询，`observation_generation` 表示新异常，分别更新。
 
-#### 3.2.4 E4/E9 统一归因
+删除 monitor 无条件 active 恢复。PORT_DOWN/PORT_ACTIVE 及成功业务可触发核验，不直接改变隔离；资源 fatal 独立关闭路径，恢复需资源重建而非仅端口 GOOD。provider 查询失败不覆写最后确认事实，快照另标验证失败/pending。
 
-完成记录有效时提取实际 opcode、执行者、对端身份、域身份和 provider 原因。WRITE 的本地/远端提示分别指向 Writer/Receiver；READ 必须按实际 provider 定义定位 Requester/Provider，不能照抄 WRITE 方向。模糊错误核验相关双方，不能直接标坏对端。
+#### 3.2.4 E4/E9 统一归因与当前操作处理
 
-适配器输出结构化 observation，上层不解释裸错误码。普通业务错误、超时、成功完成只提供线索；查询结果才提供端口事实。旧 incarnation 的 CQE 只能结算其原操作，不能修改当前实例状态。
+CQE 先按类型分类，再读取操作上下文。`FLUSH_ERR_DONE` 等特殊完成走 provider/Jetty 生命周期分支，不能像普通请求 CQE 一样解引用 user_ctx。普通 WR 才通过稳定完成记录提取 opcode、本端/对端、域与操作身份；旧 incarnation 只能结算原操作。
+
+| CQE 状态 | 核验动作（READ/WRITE 一致） | 当前操作 |
+| --- | --- | --- |
+| `4 LOC_ACCESS_ERR` | 仅本端本地 Monitor | 失败，排查本地地址/长度/权限/注册；不直接标坏任何节点 |
+| `9 ACK_TIMEOUT_ERR` | 本端 Monitor + 控制 RPC 触发对端 Monitor，各查询自身 | 失败，保留完成不确定性；不能固定归因为远端故障 |
+| 其他错误 | 保留原内存/连接/Jetty 分类规则 | 不统一转成端口故障 |
+
+WRITE 失败不得作为成功副本发布，也不自动重放可能已接受的写入；旧 WR 保持缓冲、注册和完成责任。READ 失败则本次 buffer 内容无效，不交付业务、不执行 staging 成功 H2D；重试前检查 lease/注册并完成旧 WR 收敛，不能与旧 READ 复用同一缓冲并发写入。
+
+对 E9，双方查询各自决定端口隔离，查询健康不反转本次失败。双方有健康端口则继续连接/链路/超时处理；一方查询失败保持待核验，不把 RPC 不通当作四口全坏。适配器使用实际 SDK 状态枚举确认以上映射，上层不直接比较跨 provider 裸数值。
+
+健康 Query 与请求完成链独立：CQE 失败可先返回逻辑失败，但物理资源释放仍须符合原 operation owner 的安全收敛条件。
 
 #### 3.2.5 远端端口查询与恢复调度
 
@@ -178,7 +267,9 @@ UNKNOWN 描述证据状态，不能覆盖已确认的 ISOLATED；已建立可用
 
 每 peer single-flight，每进程最多四个并发，一秒目标周期加固定 phase offset。使用有界公平队列，不建立全互连查询矩阵。一次 RPC 总 deadline 一秒，覆盖排队、解析、连接和收发；缓存控制地址。队列饱和记录延迟，不承诺任意规模都能一秒恢复。
 
-Query 失败、旧身份、非法字段、摘要过期或同步分区均不能解除隔离。控制服务仍可响应，原 Probe success 不代表端口健康。
+对端 Query 只触发对端 Monitor，由对端进程调用自身 context 的 provider，发起方不能直接查询远端 context。E9 的本地刷新与远端 Query 独立调度，不能因一侧失败跳过另一侧。
+
+远端恢复任务在独立 Query 确认至少一个域可服务后解除该消费者的端口隔离并停止轮询，不必等所有端口 GOOD；故障侧本地 Monitor 继续到 bad=0。停止的是恢复轮询，不停止摘要/视图同步；后续新异常或有效变化提示再触发核验。Query 失败、旧身份、非法字段、摘要过期或同步分区均不能解除隔离。控制服务仍可响应，原 Probe success 不代表端口健康。
 
 #### 3.2.6 节点健康摘要传播
 
@@ -200,85 +291,88 @@ CVM 节点向现有 Master 视图中的参与者同步，视图变化重新同�
 
 ### 3.3 Use Case 时序设计
 
-以下核验步骤均异步且有界，图中“确认”必须满足 3.2 的证据规则。
+CQE 当前操作处理与后台健康核验并行，不能等待查询健康后把失败改成成功。远端 Query 的 PENDING/稳定下界流程见 3.2.5。
 
-#### 3.3.1 UC-1 PUT 本地异常
+#### 3.3.1 UC-1 PUT / WRITE E4
 
 ```mermaid
 sequenceDiagram
-    participant C as Client / TE
-    participant H as 本地 HealthManager
-    participant P as URMA Provider
-    participant A as NodeAdmission
-    C->>H: WRITE 本地异常观测
-    H->>P: 合并、限频查询
-    P-->>H: 当前域有效事实
-    H->>A: 聚合全部配置域
-    A-->>C: 全域不可用则关闭新业务
-    Note over C,A: 当前 WR 仍由原 owner 等待真实收敛
+    participant C as Client WRITE
+    participant O as 原 operation owner
+    participant H as 本地域 Monitor
+    C->>O: 当前操作失败，保留在途责任
+    C->>H: E4 本地核验触发
+    H->>H: 本地 user_ctl 查询四口
+    H-->>C: 全坏才关闭域，聚合节点 gate
+    Note over O,H: 端口健康也不把失败 WRITE 改为成功
 ```
 
-#### 3.3.2 UC-2 GET 本地异常
+#### 3.3.2 UC-2 GET / READ E4
 
 ```mermaid
 sequenceDiagram
     participant C as Client READ
-    participant H as 本地核验
-    participant R as 远端 Registry
-    C->>H: opcode 和本地/模糊错误
-    opt 归因不明确
-        C->>R: 独立核验 Provider
-    end
-    H-->>C: 本地确认状态
-    Note over C,R: 本地隔离则不能靠换源绕过；双方事实分别确认
+    participant O as 原 operation owner
+    participant H as 本地域 Monitor
+    C->>O: 失败，结果无效，禁止成功 H2D
+    C->>H: E4 只触发本地核验
+    H-->>C: 更新后续准入
+    O-->>C: 真实 WR 安全收敛
+    Note over C,H: 重试检查注册和 lease，本地隔离不能换源绕过
 ```
 
-#### 3.3.3 UC-3 PUT 远端异常
+#### 3.3.3 UC-3 PUT / WRITE E9
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant S as 存储节点控制面
+    participant C as Client WRITE
+    participant L as 本地 Monitor
+    participant S as Store 控制面与 Monitor
     participant M as Master
-    C->>S: Query(expected identity, floor=0)
-    S-->>C: PENDING + 稳定下界，异步刷新
-    C->>S: Query(沿用下界)
-    S-->>C: OK + 覆盖异常的事实
-    C->>C: 确认隔离，拒绝后续提交
-    S-->>M: 健康变化摘要
-    M->>S: 独立 Query
-    M->>M: 确认后过滤新分配
+    C->>C: 失败，保留可能写入，不自动重放
+    par 本端核验
+        C->>L: 异步本地刷新
+        L->>L: 查询自身 context
+    and 对端核验
+        C->>S: 独立 Query 触发并按稳定下界取结果
+        S->>S: 查询 Store 自身 context
+        S-->>C: 有效四口事实或 PENDING/失败
+    end
+    Note over C,S: 各自确认全域不可用才隔离各自节点
+    S-->>M: 摘要变化提示
+    M->>S: 独立核验后过滤新分配
 ```
 
-#### 3.3.4 UC-4 GET 远端异常
+#### 3.3.4 UC-4 GET / READ E9
 
 ```mermaid
 sequenceDiagram
     participant C as Client READ
-    participant R as Peer Registry
-    participant S as Provider 控制面
-    C->>R: 远端/模糊异常
-    R->>S: 独立 Query 与稳定下界重试
-    S-->>R: 有效不可用事实
-    R-->>C: 关闭该副本准入
-    C->>C: 本地 gate 允许时选健康副本
-    Note over C,S: 全部副本不可用返回节点不可用，保留对象记录
+    participant L as 本地 Monitor
+    participant S as Store 控制面与 Monitor
+    C->>C: 当前内容无效，保留旧 WR 责任
+    C->>L: 本地核验
+    C->>S: 独立 Query，Store 查询自身
+    S-->>C: 有效事实或待核验
+    C->>C: 分别更新本地和远端准入
+    Note over C,S: 旧 WR 收敛且 lease/注册有效后才可重读或换源
 ```
 
 #### 3.3.5 UC-5 后台任务与恢复
 
 ```mermaid
 sequenceDiagram
-    participant S as 节点本地监控
-    participant A as 本地 NodeAdmission
-    participant R as Master / Client Registry
-    S->>A: 至少一域核验可用且资源在线
-    A->>A: 更新准入 epoch
-    A-->>R: 恢复摘要（仅线索）
-    R->>S: 独立 Query
-    S-->>R: 同身份的新鲜事实
-    R->>R: 开放后续选点
-    Note over S,R: 旧 WR、旧 Jetty 仍按各自生命周期结算
+    participant H as 故障侧 Monitor
+    participant A as 本地 Admission
+    participant R as 远端消费者
+    H->>H: 每秒查询，bad 从 4 降至 3
+    H->>A: 解除域端口隔离，聚合节点状态
+    A-->>R: 变化摘要，仅触发核验
+    R->>H: 独立 Query
+    H-->>R: 同身份有效可服务事实
+    R->>R: 解除端口隔离，停止远端恢复轮询
+    H->>H: 本地继续查询直到 bad=0 才停止
+    Note over H,R: fatal 另判，旧任务和旧 Jetty 不因恢复而复活
 ```
 
 ### 3.4 核心类与数据结构
@@ -315,6 +409,7 @@ struct UbDomainHealth {
     bool resource_online;
     bool valid;
     bool verification_pending;
+    uint32_t expected_total;           // 本方案固定为 4，另持有预期端口身份集合
     uint32_t total;
     uint32_t bad;
     uint64_t health_epoch;
@@ -345,7 +440,7 @@ struct HealthQueryTicket {
 | 对象 | 唯一写入者/责任 |
 | --- | --- |
 | provider 上下文与查询结果 | context adapter；查询生命周期受 context incarnation 约束 |
-| 域事实与路径 gate | `UbHealthManager`；只发布不可变快照 |
+| 域事实、共享 Monitor 与路径 gate | `UbHealthManager`；每四端口域一个实例，只发布不可变快照 |
 | 本地节点 gate | `NodeBusinessAdmission`；集合聚合与准入转换 |
 | 远端确认视图 | `NodeHealthRegistry`；拒绝旧身份、旧 epoch 和过期 ticket |
 | 查询/同步任务 | `NodeHealthSync`；有界、可取消，退出等待回调排空 |
@@ -360,6 +455,8 @@ MR 引用不等于持有实际用户内存。裸指针调用者须保持缓冲�
 #### 3.5.1 URMA Provider 适配
 
 `UrmaPortStatusProvider` 封装正式头文件与结构体。CMake 检测声明/结构体，运行时检查 opcode 支持；不能为通过编译构造私有 ABI 数字，也不能对 enum 使用无效的宏存在性判断。端口结果必须完整校验，不支持时返回 UNSUPPORTED，不能返回伪造健康。
+
+对齐 [yuanrong UrmaPortStatusProvider](../../../yuanrong-datasystem/src/datasystem/common/rdma/urma_port_status_provider.cpp) 的正式调用：本地 `urma_context_t` 上调用 `urma_user_ctl()`，`in.opcode = BONDP_USER_CTL_QUERY_PORT_STATUS`，输出使用 `bondp_query_port_status_out_t`，以返回的 `out.len` 校验 port_count 对应长度和数组容量。逐项只接受 BONDP_PORT_STATUS_GOOD/BAD，按三元组排序判重后重算计数。Supercache 额外核对预期四口完整身份集合；失败或缺口不返回 bad=0，不覆写最后确认状态。
 
 #### 3.5.2 控制协议适配（对应参考 Proto 接口）
 
@@ -433,13 +530,13 @@ Client 数据入口先检查本地 gate，TransferSubmitter 在任意数据策�
 
 ### 3.8 Use Case DryRun
 
-| 场景 | 观测后的核验 | 判定与后续行为 |
+| 场景 | 健康核验 | 当前操作与后续行为 |
 | --- | --- | --- |
-| UC-1 PUT 本地异常 | 查自身，目标不凭空标坏 | 本地全域不可用才关闭；当前事务按已 post 范围结算 |
-| UC-2 GET 本地异常 | 本地明确则查自身，模糊则双方分别查 | 本地关闭时禁止换源绕过 |
-| UC-3 PUT 远端异常 | Client 与 Master 各自确认目标 | 后续提交/分配过滤，旧 PutStart 不绕过 |
-| UC-4 GET 远端异常 | 确认 Provider，必要时查询自身 | 换健康副本或节点不可用，保留对象存在事实 |
-| UC-5 后台与恢复 | 逐域聚合；远端独立核验恢复 | 单域退化不停节点；恢复不复活旧资源 |
+| UC-1 PUT/WRITE E4 | 只查本端 | 当前失败不重放；本地确认全域不可用才隔离 |
+| UC-2 GET/READ E4 | 只查本端 | 内容无效、无成功 H2D；注册与旧 WR 安全检查后才可重读 |
+| UC-3 PUT/WRITE E9 | 两端各查自身 | 谁确认全坏隔离谁；双方有健康端口仍保留本次失败 |
+| UC-4 GET/READ E9 | 两端各查自身 | 读源与本地分别过滤；安全收敛后重读，不误判对象不存在 |
+| UC-5 后台/恢复 | WRITE/READ 同样按 4/9 触发；逐域聚合 | bad=4→3 解除端口隔离；远端停止恢复轮询，本地继续至 0 |
 
 以上为设计推演，不是已执行测试报告。
 
@@ -447,7 +544,7 @@ Client 数据入口先检查本地 gate，TransferSubmitter 在任意数据策�
 
 ### 4.1 SDK 接口
 
-保持现有 Put/Get、批量、范围和异步签名。补充节点不可用错误契约；所有新数据入口在策略选择前执行本地准入。管理完整副本查询、健康查询和既有事务结算不因数据隔离关闭。
+保持现有 Put/Upsert/Get、批量、范围和异步签名。补充节点不可用错误契约；所有新数据入口在策略选择前执行本地准入。管理完整副本查询、健康查询和既有事务结算不因数据隔离关闭。
 
 ### 4.2 内部控制接口（对应参考 Proto 接口）
 
@@ -458,7 +555,8 @@ Client 数据入口先检查本地 gate，TransferSubmitter 在任意数据策�
 | 配置契约 | 初始值/行为 |
 | --- | --- |
 | UB 隔离模式 | off；可切 observe/enforce，enforce 前检查参与者能力 |
-| 域查询间隔 | 一秒，单域 single-flight；恢复目标周期一秒 |
+| 域查询间隔 | 一秒，四端口域共享 Monitor、single-flight；本地至 bad=0 停止 |
+| 远端恢复轮询 | 一秒目标周期，独立确认节点可服务后停止；不停止健康同步 |
 | 远端查询并发 | 每进程最多四个，peer single-flight，有界公平队列 |
 | RPC 总 deadline | 一秒，覆盖所有阶段 |
 | 摘要兜底周期 | 一秒，变化立即合并上报 |
@@ -473,11 +571,13 @@ Client 数据入口先检查本地 gate，TransferSubmitter 在任意数据策�
 - 普通 Ping、业务成功、被动摘要、TTL 到期均不解除已确认隔离；fatal 需资源重建。
 - Store gate 覆盖 TCP/memcpy/staging/文件路径；TE 仍保留最终节点/路径/Jetty 守卫。
 - 查询与控制面有界运行，不能在 CQE/listener 中同步等待；控制服务和安全清理继续。
+- E4 只触发本端，E9 触发双方各查自身；本次失败与后续健康准入分离，不能用健康查询修正操作结果。
+- 四口集合不完整不能作为恢复证据；远端恢复轮询确认可服务即停，本地监控持续至全 GOOD。
 - 退出依次关闭新准入、注销并排空查询、停止未 post 生产者并 Seal、保持 CQE/AE/flush 收敛、完成 H2D/缓冲责任，最后释放 target/MR/队列/context。健康 Stop 不替代 DMA 排空。
 
 ## 6. Example
 
-以下为语义示例，不是最终线协议；端口总数只代表各服务域自身集合。
+以下为语义示例，不是最终线协议；每个服务域的预期集合均为四口，不按 context 重复统计。
 
 ### 6.1 存储节点健康状态示例
 
@@ -489,8 +589,8 @@ Client 数据入口先检查本地 gate，TransferSubmitter 在任意数据策�
   "state": "ISOLATED",
   "reason": "ALL_SERVICE_DOMAINS_UNAVAILABLE",
   "domains": [
-    {"id": "A", "resource_online": true, "valid": true, "pending": false, "total": 2, "bad": 2, "query_seq": 12},
-    {"id": "B", "resource_online": true, "valid": true, "pending": false, "total": 2, "bad": 2, "query_seq": 15}
+    {"id": "A", "resource_online": true, "valid": true, "pending": false, "expected_total": 4, "total": 4, "bad": 4, "query_seq": 12},
+    {"id": "B", "resource_online": true, "valid": true, "pending": false, "expected_total": 4, "total": 4, "bad": 4, "query_seq": 15}
   ]
 }
 ```
@@ -499,7 +599,9 @@ Client 数据入口先检查本地 gate，TransferSubmitter 在任意数据策�
 
 ### 6.2 部分故障但不隔离
 
-A 域 `total=2,bad=2`；B 域 `total=2,bad=1` 且资源在线，两者均为有效新鲜结果。节点为 DEGRADED，新业务可走 B 的合法路径；不能把 A 从配置集合删除。B 的 GOOD 端口若伴随未修复 fatal，则不能据此恢复节点。
+A 域 `total=4,bad=4`；B 域 `total=4,bad=1` 且资源在线，两者均为有效新鲜结果。节点为 DEGRADED，新业务可走 B 的合法路径；不能把 A 从配置集合删除。B 的 GOOD 端口若伴随未修复 fatal，则不能据此恢复节点。
+
+若唯一域从 bad=4 降到 bad=3，资源在线且核验有效，则立即解除端口隔离并进入 DEGRADED；本地仍每秒查至 bad=0，远端独立确认可服务后停止恢复轮询。预期四口只返回三口全 GOOD 时查询无效，不能解除隔离。
 
 ### 6.3 Client 本地快速拒绝
 
@@ -544,7 +646,13 @@ Client 缓存副本 A/B，独立确认 A 隔离后先过滤 A，再按原策略�
 | 分支/竞争 | 必须验证的结果 |
 | --- | --- |
 | 单端口坏、单域全坏、多域全坏、空集合 | 依次退化/局部关闭/节点隔离/NOT_READY，不误判 |
-| pending、非法结果、重复端口、旧身份、旧集合 | 不新增错误隔离，不解除旧关闭 |
+| pending、非法结果、重复端口、旧身份、旧集合、四口缺一 | 不新增错误隔离，不解除旧关闭 |
+| 同域多 context、独立多域 | 同域只建一个 Monitor，独立域不误合并，故障域不消失 |
+| 四种 WRITE/READ 场景分别注入 E4/E9 | E4 仅本端，E9 双方各查自身，不按数据方向翻转 |
+| E9 两端健康/一端全坏/两端全坏/对端 RPC 失败 | 分别不隔离/隔离确认侧/隔离双方/待核验，不直接归责远端 |
+| bad=4→3→0、失败穿插 | 3 解除端口隔离，远端确认后停轮询，本地至 0 才停；失败保留状态 |
+| FLUSH_ERR_DONE 等特殊完成 | 分类后处理，不当作普通 Slice user_ctx 解引用 |
+| 失败 READ、staging、重读同 buffer | 不交付无效内容、不执行成功 H2D，旧 WR 收敛后才重用 |
 | Query floor 重试、新异常、并发重复请求 | 下界稳定，合并刷新，新异常使旧 ticket 失效 |
 | PORT_ACTIVE、普通 Ping、成功业务、摘要恢复 | 只触发核验，不直接恢复 |
 | 端口恢复与 fatal 并存 | fatal 未重建前不能开放该域 |
@@ -563,58 +671,10 @@ UT 注入 provider、clock 与 Query；集成测试覆盖 Client/Master/TE 和�
 
 | UC | 验收重点 |
 | --- | --- |
-| UC-1 | 本地 WRITE 异常只触发核验，全域确认后关闭全部新策略 |
-| UC-2 | READ 按实际方向归因；本地隔离不允许换源绕过 |
-| UC-3 | 目标核验、Client 拒绝、Master 独立过滤及 PUT 事务收敛完整 |
-| UC-4 | 读源过滤、缓存复查、健康副本重试及对象存在语义完整 |
-| UC-5 | 后台双方 gate、多域退化、独立恢复及旧资源不复活完整 |
+| UC-1 | WRITE E4 只触发本地核验，不重放可能接受的 WRITE；端口健康也不改成功 |
+| UC-2 | READ E4 只触发本地核验，失败内容无效，无成功 H2D，本地隔离不换源绕过 |
+| UC-3 | WRITE E9 双方独立核验、按事实隔离，Master 过滤与 PUT 撤销/结算完整 |
+| UC-4 | READ E9 双方核验，注册/lease 与旧 WR 安全后重读，所有源不可用仍保留对象语义 |
+| UC-5 | Copy/Move 成功提交前不删源；多域正确聚合，本地与远端恢复轮询停止条件不同 |
 
 性能验收同时记录无故障热路径开销、异常查询合并率、恢复/传播延迟和控制队列饱和行为；不以不可证明的全局一秒原子恢复作为验收条件。
-
-## 9. 两人并行开发与测试分工
-
-本节按参考文档给出后续实施分工建议；本次交付仅为设计文档。
-
-### 9.1 分工原则
-
-A 负责本地事实和准入核心，B 负责远端核验、传播和消费者过滤。先冻结身份与证据契约，以接口和测试替身并行开发，不复制节点状态机。Jetty 负责实际完成，不归健康模块接管。
-
-### 9.2 前置契约冻结点
-
-共同确定 node/domain 身份、集合代际、异常与查询序号、状态与原因、permit 线性化点、Query 稳定下界、版本化序列化及错误映射。明确资源 fatal、UNKNOWN、HA REVALIDATING 与 ISOLATED 的区别。
-
-### 9.3 开发者 A：本地端口事实、限频与节点准入
-
-实现 provider 能力探测与校验、域 manager、观测归因、本地聚合 gate、最终 post 许可和有序 Stop。完成多域/旧身份/恢复/关闭竞争 UT，与 Jetty 方案核对实际缓冲和完成责任。
-
-### 9.4 开发者 B：聚合摘要、远端查询与路由传播
-
-实现 Probe action、总 deadline、有界远端任务、独立确认 registry、摘要与视图同步、Master eligibility、Client 缓存过滤，以及 HA/CVM 围栏。完成协议、分配、重启与混部集成测试。
-
-### 9.5 并行阶段与集成顺序
-
-1. 冻结契约，落实稳定完成与实际缓冲持有基础。
-2. A 开发本地事实/准入，B 用替身开发协议/传播；接入本地业务入口与跨策略 gate。
-3. 联调远端 Query、Master/Client 过滤和事务收敛，再覆盖 HA/CVM。
-4. observe 运行验证事实与时延；通过完整部署能力检查和实机测试后再启 enforce。
-
-### 9.6 文件冲突与测试门禁
-
-新增组件就近分层，共享接口由一方维护、另一方评审；避免两方同时重写 endpoint 或 master_service。集成前检查 8.1/8.2，涉及 post/完成的改动须同时验证 Jetty 生命周期契约。能力缺失或存在业务绕过路径时禁止启用 enforce。
-
-### 9.7 修改文件清单
-
-#### 9.7.1 开发者 A：本地端口事实与本地准入
-
-- kunpeng_transport 的 `ub_transport.cpp`、`ub_context.cpp`、`urma/urma_endpoint.cpp` 及配套头文件/CMake：事实、查询、身份、最终许可。
-- 新增就近的 provider adapter、UbHealthManager 与 Store NodeBusinessAdmission，保持通用摘要边界。
-- `client_service.cpp`、`transfer_task.cpp`：本地数据入口、跨策略双方 gate 与实际 buffer hold；通用 transport hook 的契约由双方共同评审。
-
-#### 9.7.2 开发者 B：协议、远端核验、传播与路由
-
-- `transfer_metadata.cpp`、`transfer_metadata_plugin.cpp` 及对应描述类型：Probe action、身份/能力与 deadline。
-- 新增 Store NodeHealthRegistry/NodeHealthSync；`rpc_service.cpp`、`master_client.cpp`：版本化同步。
-- `master_service.cpp`、`allocation_strategy.h`、`replica_selection.h`：统一 eligibility、提交复查和副本硬过滤。
-- `cvm/inter_master_rpc.cpp`、`ha/snapshot/master_snapshot_codec.cpp` 及对应日志回放接入：跨 Master 目的侧过滤、确认状态持久化、接管重验。
-
-具体接入文件链接见 3.7。所有改动围绕既定故障闭环展开，不增加新的调度模型、成员框架或资源池策略。
