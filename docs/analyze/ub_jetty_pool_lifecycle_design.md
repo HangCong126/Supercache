@@ -1,9 +1,9 @@
 # classic UB Jetty 池化与生命周期详细设计
 
-> 设计状态：待实现；日期：2026-10-13。
+> 设计状态：待实现；更新日期：2026-10-15。
 > Mooncake 基线：`supercache-snapshot-930` / `a2f25168`。
 > 参考：已认证读取的 [yuanrong issue #30](https://gitcode.com/hc147/yuanrong-datasystem/issues/30)，及本地 yuanrong `eacc9857` 的 pool、lease、PostGate、flush/quarantine 实现。
-> 前置契约：[UB 故障隔离设计](ub_fault_isolation_design.md)。本文仅设计 classic `kunpeng_transport`，不修改负载调度策略。
+> 前置契约：[节点业务隔离设计](ub_fault_isolation_design.md)；关联：[端口故障触发的时延成本调度](ub_load_scheduling_design.md)。本文仅设计 classic `kunpeng_transport` 的资源复用与安全执行。
 
 ## 1. 目标与交付边界
 
@@ -12,6 +12,10 @@
 第一版采用：**RM 模式、每 context 发送池、每 context 一个共享目标 Jetty、每传输组一个 lane lease、稳定完成 token、后台安全退役与补池**。
 
 RC 保留 peer 绑定资源，不跨 peer 借还；但使用相同的完成身份、计数和退役规则。原生 READ 与 WRITE 均覆盖，不照搬 yuanrong 的 RPC WRITE 写回模型，也不增加 GatherWrite、新副本策略或 TCP 自动回退。
+
+本次修订保留池化核心，只补节点业务准入、明确传输组 owner、增加必要的 READ 完成观测，并收敛与调度的耦合。Master 放置、HA/CVM、时延权重及节点健康同步由前两个方案负责，本文不重复建设。
+
+不增加动态池大小、前台专用 lane、新 peer 公平配额、容量/拥塞选路或跨 transport 的通用资源框架；不以重构 SchedulerCore prepared dispatch 为池化交付前提。池大小、额外退役窗口与硬件 credits 是静态资源安全约束，不是调度评分。
 
 ## 2. 当前实现与参考差异
 
@@ -37,6 +41,8 @@ yuanrong 以单活动 context 和 RPC/逻辑传输为资源边界；Mooncake 同
 
 issue #30 强调封口与事件结算后归还；当前 yuanrong 源码另有超时 force-release 和 orphan 记账。第一版不迁移该优化：有未收敛 WR 的 Jetty 不回可用池，先保守退役与有界保留。
 
+对齐源码入口：[SendJettyPool/Lease](../../../yuanrong-datasystem/src/datasystem/common/rdma/urma_send_lane.h)、[UrmaResource](../../../yuanrong-datasystem/src/datasystem/common/rdma/urma_resource.h)、[资源实现](../../../yuanrong-datasystem/src/datasystem/common/rdma/urma_resource.cpp)。复用其“Resource 拥有资源、Pool 管容器、Lease 管使用权、Event 管一次完成”的边界，不复制其进程单例或 Worker BatchGet RPC 结构。
+
 ## 3. 高内聚的模块与所有权
 
 由 `UrmaContext` 持有一个 `UrmaJettyResource`，统一拥有该 context 的发送池、共享目标、Jetty registry、完成记录、补池和退役任务。
@@ -50,7 +56,7 @@ issue #30 强调封口与事件结算后归还；当前 yuanrong 源码另有超
 | `UbCompletionRecord` | 一个 WR 的 token、接受状态、完成 CAS、lane、连接和注册/缓冲引用 |
 | `UrmaEndpoint` | remote identity、imported target 和连接/注册缓存；pooled RM 不拥有本地发送 Jetty |
 
-不再建立第二个进程级单例。健康模块只决定是否可准入；resource 只决定 Jetty 是否可安全使用和回收。两者通过既定 permit 和观测接口单向接入。
+不再建立第二个进程级单例。NodeBusinessAdmission 决定节点业务准入，UbHealthManager 决定本地/远端路径准入，resource 决定 Jetty 是否可安全使用和回收。三者通过窄的 permit 和观测接口衔接，resource 不查询 Master，也不计算时延成本。
 
 ```mermaid
 flowchart LR
@@ -76,6 +82,8 @@ SEND_LANE 和 SHARED_TARGET 是软件责任角色；底层仍使用正式 URMA J
 
 每 context 预创建有界 SEND Jetty 池，固定分配到其 JFC 分片，并保留现有 NUMA/chip hint。每 context 预创建一个共享目标 Jetty，复用 context 级 JFR/接收配置，供其他 peer 导入并发起 READ/WRITE。
 
+按元戎区分发送池复用的 JFR、共享接收 Jetty 绑定的接收配置及连接 imported target 的所有权。分别管理其引用和清理责任，不因名称中都有“共享”就合并生命周期；具体 JFR 绑定遵循正式 provider 契约，不新建通用共享资源抽象。
+
 发送 lane 不向对端发布，不需要在每次借还时重新握手。远端 imported target 按 `(peer incarnation, remote context, target epoch)` 缓存，lease 借还不能删除它。
 
 启用前用真实 provider 验证：RM 发送 Jetty 可顺序访问不同 target；共享目标支持原生 READ/WRITE、bonding 与当前 segment 注册属性。不能从 RM 名称直接推导所有驱动支持相同语义。
@@ -98,13 +106,19 @@ peer 不支持或使用 RC 时采用 legacy 握手及原 Jetty 数组。模式�
 
 同组的多个 slice/WR 共享一个 lease；跨 HCA、跨远端 target 或不同方向分别持有 lease。使用 SchedulerCore 时以一个 physical grant 为 task 边界，grant 之间释放再竞争资源，避免大请求长期独占 lane。未启用调度时以原 TransferTask 为边界。
 
+这里只消费既有 grant 边界，不修改 SchedulerCore 的公平、quantum、HIGH reserve 或 grant 大小。元戎由 BatchGet RPC owner Acquire/Seal，Mooncake 对应掌握全部 slice/窗口生产者的 task 提交 owner；不能把含多个 peer 的 BatchID 机械映射成一个 lane。
+
 BatchID 可以包含多 peer 和多 task，不强行共享一个 lane；本特性不提供整个 batch 的资源原子性或业务事务。
 
 ### 5.2 先准备计划，再允许实际 post
 
 将既有本地选路与 worker 远端解析收敛为 UB 内部 `UbTaskPlan`，先确定目标与注册兼容性、准备可用 connection，然后冻结有界的传输组描述。它按范围迭代生成 slice，不预先分配巨大请求的全部 WR。
 
+UbTaskPlan 是私有提交上下文，只描述原选路已确定的本次资源组，不建设通用 planner 或设备性能选路器。本方案不按空闲 lane、队列、P99 或节点权重更换 HCA/peer，也不在 endpoint 中重新执行 Master 选点。
+
 对一个 task/grant 所需各组进行 try-acquire：任何组缺少资源，立即归还已经取得但未 post 的 lease，暂不提交该 task。不能持有部分 lane 无限等待其他组；返回背压，或进入受限队列按 deadline 重试。其他独立 task 仍遵循既有部分 batch 成功语义。
+
+零 WR、未留下预留的资源不足可以按既有提交/队列接口重试；已 post 前缀的错误不能被包装成整个范围可重试。若当前调度接口不能安全表达背压，保留可识别错误及已有完成责任，不为池化额外引入通用 READY/DEFER/COMMITTED 改造，也不声称已具备安全 DEFER。
 
 首个 WR 前冻结逻辑 slice 数、组数和终态预期；内部重试可以增加物理 WR 记录，但不增加逻辑 slice 完成次数。这样避免 CQE 早到时把尚未构建完的 task 误判完成。metadata/握手是独立准备阶段，不持有 pool 锁或发送 lane 等待远端响应。
 
@@ -131,7 +145,7 @@ pending 按 WR 数量计数，不按 slice 对象数之外的业务对象、SGE 
 
 ### 6.1 稳定 completion token
 
-`wr.user_ctx` 改为 context 内不复用的 64-bit token，不再保存裸 Slice*。registry 使用有界、可分片的 slot/record 分配，token 单调增长并校验 context/lease/Jetty generation，回绕前停止准入。
+`wr.user_ctx` 改为 context 内不复用的 64-bit token，不再保存裸 Slice*。registry 使用有界 slot/record 分配，token 单调增长并校验 context/lease/Jetty generation，回绕前停止准入。记录限于 UB，不扩展成其他 transport 共用的事件框架，初版不要求分片优化。
 
 record 持有 lane、connection、imported target、本地/远端注册资源引用及 task 的完成责任。访问 Slice/TransferTask 的前提是 batch 仍被保留；token 本身不证明业务对象或调用者分配的内存仍然存活。
 
@@ -159,6 +173,10 @@ post 返回前不回收其 WR 描述所需状态；最终 lease 归还还需 act
 
 READ staging 的 lane 在硬件 WR 结束后可按规则回池，但 staging 缓冲与 task 必须保留到 H2D 完成。硬件结束和消费者结束分开计数，不用 lane 生命周期代替缓冲生命周期。
 
+为关联的时延成本方案提供一个窄的 READ 完成观察入口：首次 provider 提交前预记开始时间，确认 WR 被接受后生效；记录 CQE 实际完成时间，不能等 post 返回后才起表而遗漏早到完成。最后硬件责任收敛时生成一次带目标节点身份、字节、耗时及成功/重试/partial post 标记的值记录。仅合格成功组可成为统计样本；先复制观察值再发布任务完成，不额外持有裸 Slice/Task。观察通知有界、非阻塞，丢样本不影响资源结算。
+
+P50/P99、归一化、非亲和惩罚及报告由外部统计/调度模块处理；resource 不存这些模型。正常归还不等待统计上报，也不把 pool-empty 等待或 H2D 混入硬件服务计时。错误和 timeout 标记必须使样本不可用，不能伪造成功延迟。
+
 flush/suspend done 等 user_ctx 无效的记录先按类型分类，通过 Jetty registry 处理；不能解引用为 Slice。flush 返回的逐 WR 记录和 JFC 普通完成共用唯一结算入口。
 
 ## 7. Jetty 生命周期与 provider 契约
@@ -180,11 +198,15 @@ stateDiagram-v2
 
 ### 7.1 Close 与 PostGate
 
-健康 permit 控制“路径是否允许”，Jetty PostPermit 控制“资源是否仍允许 post”。两者分别覆盖不同故障域，所有 post 入口必须同时取得。
+Acquire 前快速检查本地和远端节点业务准入及路径准入；队列唤醒、重试、新窗口重新检查。最终 post 同时取得节点业务 permit、UbPostPermit 和 Jetty PostPermit，并确认注册及硬件 credits 有效。NodeBusinessAdmission 通过 TE 通用窄接口注入，UB 不依赖 Store 的具体类。
+
+节点 permit 控制“业务是否允许”，路径 permit 控制“该域是否允许”，Jetty PostPermit 控制“资源是否仍允许 post”。节点关闭后不能取得新许可；关闭前取得的有限同步 post 按既有准入收敛。各 gate 不等待 CQE，也不持有业务/健康状态锁调用 provider。
 
 PostGate 用同一个原子状态表示 closing 和 active calls；BeginRetire 首先关闭 gate，然后撤下池成员并安装 pending 记录，最后 arm finalizer。已取得许可的 post 退出后才能调用 modify/flush/delete。不能只做两次无关联的 active 检查。
 
 post permit 只覆盖同步 provider 调用，不等 CQE。provider 资源删除与完成发布都由状态机认领一次；AE、CQE、timeout、shutdown 可重复请求退役，不重复控制调用。
+
+节点隔离先停止未 post 生产者并由原 owner Seal；不能把停止业务等同于清空池或退役全部 Jetty。单口故障只触发端口核验；Jetty 是否失效仍按已确认的 provider/资源分类处理，不把所有非成功 CQE 都变成重建请求。节点恢复不复活已退役对象，替代资源仍由 refill 创建新身份。
 
 ### 7.2 Flush 必须有证据
 
@@ -224,7 +246,7 @@ adapter 返回结构化结果：`HANDLE_RETAINED`、`HANDLE_CONSUMED`、`UNKNOWN
 
 共享目标的入站 one-sided READ/WRITE 不一定产生可枚举的本地业务 CQE。仅本地 SEND pending=0 不能证明远端 DMA 已结束；adapter 需提供停止旧目标访问并排空入站的屏障。能力不足时保留整个相关注册域/context，不先注销内存。
 
-第一版不增加全局广播。只让已使用的 peer 按既有握手、失败后刷新和前一方案的定向控制查询更新身份。共享目标分片可后续按实测故障域需求设计，不进入首轮。
+第一版不增加 Jetty 专用全局广播。只让已使用的 peer 按既有握手、失败后刷新和前一方案的定向控制查询更新身份；节点健康同步继续由隔离方案负责。共享目标分片可后续按实测故障域需求设计，不进入首轮。
 
 ## 9. 超时、缓冲安全和有界背压
 
@@ -255,11 +277,13 @@ create_count <= max(0, min(T - A, T + E - A - R - L - C))
 
 resource 在同一预算锁内预留创建名额并转移状态，每个 identity 只归属一个统计桶；provider 调用在锁外。共享目标与其他 native Jetty 另计硬件总上限，结合 device max_jetty、JFC depth 和 WR credits 校验，不能只控制池容器大小。
 
-每 `(peer incarnation, local context)` 设置同时占用 lease 的配额，正常借出时计入，唯一归还或转移到退役 owner 时结算；退役资源仍受 R 和总物理预算限制。配额通常小于 T，保留其他 peer 的使用机会；多 context 总配置也必须校验进程资源上限，不能每张卡独立放大到无界。
+多 context 的总配置必须校验进程资源上限，不能每张卡独立放大到无界。首版只保留 T/E、硬件 credits、记录和缓冲保留上限，不新增 per-peer 公平配额、HIGH 专用 lane 或按坏口/时延动态扩缩池。
 
 另设 completion record 数量和 quarantine 所持缓冲字节上限。达到任一上限停止相关新准入，不能为了满足预算释放未证实安全的对象。
 
-空池 TryAcquire 返回可识别的背压，无同步 create、无无限等待。显式调度路径可在有界队列等待；旧路径返回资源不足。TE 不自行换协议，尤其不能把已提交 WRITE 重放成 TCP。
+空池 TryAcquire 返回可识别的背压，无同步 create、无无限等待。已有接口能安全接纳零 WR 工作时可在其有界队列等待，否则返回资源不足；不得依赖尚未实现的通用 prepared dispatch。空池不触发 Master 重选或时延权重更新，诊断指标也不作为新增选路输入。
+
+元戎 BatchGet 在首个数据提交前固定 TCP fallback，是保留它已有的回退链路。Mooncake 本方案不新增 UB→TCP 自动切换；若某入口已有合法 fallback，需在零 WR、节点准入允许时固定模式并保留原错误，不能在提交前缀后整批重放。已隔离节点不能通过 fallback 承接新业务。
 
 ## 10. 初始化、补池与退出
 
@@ -269,7 +293,7 @@ refill 线程只为明确缺口创建新 identity，在锁外调用 provider，�
 
 退出顺序：
 
-1. 关闭 transport、健康、pool 和 post 入口；停止新 handshake/import 及 refill 发布。
+1. 关闭节点业务、transport、健康、pool 和 post 入口；停止新 handshake/import 及 refill 发布。
 2. 取消未 post 队列并 Seal；让已取得许可的同步 post 退出。
 3. 保持 CQE/AE/flush 处理运行，推进在途结算和 Jetty 退役。
 4. 安全撤销共享目标、连接 target/segment；确认本地与入站硬件不再访问注册。
@@ -280,25 +304,25 @@ refill 线程只为明确缺口创建新 identity，在锁外调用 provider，�
 
 ## 11. 文件布局与分阶段实施
 
-以下为拟修改位置，本次仅新增设计文档。
+以下为拟修改位置，运行时尚未实现；本次仅修订现有设计文档。
 
 | 位置 | 内容 |
 | --- | --- |
 | `include/.../kunpeng_transport/urma/urma_jetty_resource.h` 与对应 `.cpp` | Jetty wrapper、resource owner、provider 清理结果、pool、registry 和后台任务 |
 | `include/.../kunpeng_transport/ub_lane_lease.h` 与对应 `.cpp` | 纯 lease/producer/Seal/唯一结算状态机，provider 无关 |
 | `include/.../kunpeng_transport/ub_completion.h` 与对应 `.cpp` | 稳定 token、WR 接受/终结状态、有界完成 registry |
-| 既有 `ub_transport.cpp` / `ub_context.cpp` | task plan、跨 context 资源预留、生产者收敛、缓存回收与 staging 安全 |
+| 既有 `ub_transport.cpp` / `ub_context.cpp` | 私有提交上下文、跨组资源预留、生产者收敛、缓存回收与 staging 安全 |
 | 既有 `urma_endpoint.h/.cpp` | pooled/legacy 连接模式、post adapter、CQE/AE 分类、共享目标握手 |
 | `transport.h` 的 UB 私有字段与必要 hook | 替换深度/endpoint 裸引用；保留其他 transport 布局语义 |
-| Store `transfer_task.*` 及实际 buffer owner 接入点 | UB 超时保留与安全完成，检查 BatchBusy；不修改存储事务 |
-| config、UB CMake 与 tests | 启用开关、目标/额外容量/peer 配额、provider 契约检测与 UT/ST |
+| TE 窄准入/完成 hook、Store `transfer_task.*` 及实际 buffer owner | 节点 gate、READ 值观察、超时保留与 BatchBusy；不修改存储事务或计算权重 |
+| config、UB CMake 与 tests | 启用开关、目标/额外容量、provider 契约检测与 UT/ST；不增加动态调度配置 |
 
 实施按安全依赖排序：
 
 1. 生命周期基础：稳定 token、partial post、唯一 credits、PostGate、flush/delete 结果分类；先覆盖原 endpoint 模式。
-2. 池与 lease：纯池、生产者封口、task plan、容量和有界背压；完成 Store 缓冲保留前置接入。
+2. 池与 lease：纯池、生产者封口、私有提交上下文、静态预算与已有背压；完成节点 gate 和 Store 缓冲保留接入。
 3. pooled RM 与共享目标：能力协商、epoch、target/segment 引用、RC/旧端兼容。
-4. 故障与退出验证后灰度启用，最后评估池大小与 JFC 分片；不把扩大池容量当作可靠性修复。
+4. 接入必要的 READ 完成观察；故障与退出验证后灰度启用。池/JFC 分片和池大小调优不作为首版新增优化，不把扩大容量当作可靠性修复。
 
 ## 12. 验证与验收
 
@@ -306,7 +330,9 @@ refill 线程只为明确缺口创建新 identity，在锁外调用 provider，�
 | --- | --- |
 | 同 task 多 slice、多窗口 | 每传输组只 Acquire 一次，生产者结束前不 Seal/归还 |
 | 多 peer/multi-HCA、scheduler grants | 不跨注册域混池，grant 完成后释放；没有部分持有等待死锁 |
-| 空池、peer 配额、完成表满 | 首个 WR 前有界背压，不创建热路径 Jetty，不自动 TCP 重放 |
+| 空池、静态预算、完成表满 | 首个 WR 前有界背压，不创建热路径 Jetty，不自动 TCP 重放 |
+| 节点隔离与 Acquire/post/重试竞争 | 三层 permit 生效；已 post 不清零，TCP 不绕过，恢复不复活退役 Jetty |
+| READ 唯一完成、失败/重试/partial post、H2D 延迟 | 仅输出合格值样本，统计不阻塞归还，不混入 H2D、不重复采样 |
 | CQE 早于 post 返回/Seal | 记录可定位，active call 和 producer 阻止提前复用 |
 | valid bad_wr 前缀、null/越界 bad_wr | 只撤销可信未接受后缀；模糊责任保留并退役 |
 | 重复 CQE、旧 token、fake CQE、AE 竞态 | 恰好一次结算，深度不负数，不解引用无效 user_ctx |
@@ -323,12 +349,14 @@ UT 使用 fake provider、可控 post/flush 返回及确定性 producer 调度�
 
 性能评价：endpoint 数量变化时 Jetty 物理数量、顺序复用创建次数、pool/registry 锁竞争、每 WR token 成本、不同对象大小的吞吐及 p99。池化本身不保证提高带宽。
 
-最小指标：idle/leased、retiring/quarantine/creating、唯一 native 数量、pending WR/bytes、pool-empty 和 per-peer 拒绝、late/duplicate CQE、retire/drain 耗时、refill 失败及 oldest quarantine age。
+最小指标：idle/leased、retiring/quarantine/creating、唯一 native 数量、pending WR/bytes、pool-empty 和准入拒绝、late/duplicate CQE、retire/drain 耗时、refill 失败及 oldest quarantine age。这些仅用于诊断，不反馈到新调度权重。
 
 ## 13. 与前后两个特性的边界
 
-健康模块关闭准入时，先取消未 post 的任务；不因端口 all-bad 就立即销毁全部 Jetty。Jetty AE/不可用记录交资源状态机处理，端口恢复也不能把退役 Jetty 放回池。
+节点隔离方案决定业务能否执行，路径健康决定域能否使用；二者关闭时先取消未 post 生产者并 Seal，不因端口 all-bad 就立即销毁全部 Jetty。Jetty AE/不可用记录交资源状态机处理，节点/端口恢复均不能把退役 Jetty 放回池。
 
-后续负载调度可读取 context 的可用 lane、排队量与在途字节。idle lane 数不等于剩余带宽，调度不能绕过健康许可、生命周期许可或硬件 credits。
+最新负载方案在坏端口触发后，由 Master 使用读服务时延成本和健康比例调整后续单键新放置。Jetty 层只执行既定目标并提供合格 READ 完成值，不计算 P50/P99、节点权重或设备成本，也不以空闲 lane、队列和在途字节改变 peer/HCA。
+
+公共复用只限节点身份/版本、窄准入 hook 和完成值接口。池、lease、WR registry、provider adapter 与退役状态机仍留在 kunpeng_transport；不新增 Master/HA/CVM Jetty 状态同步，不建立覆盖所有 transport 的资源框架。
 
 关键冻结契约：传输组粒度、单一 Seal owner、完成 token、provider 清理结果语义、共享目标 epoch、buffer hold 和容量预算。实现前需先验证实际部署 provider；契约无法证明时保持兼容模式，不能仅开启池化开关。
