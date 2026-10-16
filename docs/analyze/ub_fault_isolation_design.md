@@ -1,6 +1,6 @@
 # Mooncake UB 多端口故障隔离适配设计
 
-> 设计状态：待实现；更新日期：2026-10-15。
+> 设计状态：待实现；更新日期：2026-10-16。
 > 运行时代码基线：`supercache-snapshot-930` / `a2f25168`；文档提交不改变该代码基线。
 > 结构参考：认证读取的 [yuanrong issue #28](https://gitcode.com/hc147/yuanrong-datasystem/issues/28)；实现对照：同级 yuanrong-datasystem `eacc9857`。
 > 关联：[Jetty 池化与生命周期](ub_jetty_pool_lifecycle_design.md)、[端口故障触发的时延成本调度](ub_load_scheduling_design.md)。本文只设计故障事实、业务准入与恢复，不接管资源池或调度权重。
@@ -21,13 +21,27 @@ Supercache 源码中的 Client 也可提供存储内存。同一进程可以同�
 
 ### 0.2 SET/PUT：分配和发布协调发生变化
 
-```text
-yuanrong 典型 UB SET：
-Client 向 Worker 准备对象空间 → Client UB WRITE 到 Worker → Publish RPC 发布
-
-Supercache 内存 PUT：
-Client 向 Master PutStart → Master 返回副本地址
-→ Client TE WRITE 到 Store → 向 Master PutEnd 或 PutRevoke
+```mermaid
+sequenceDiagram
+    participant YC as yuanrong Client
+    participant YW as yuanrong Worker
+    participant C as Supercache Client
+    participant M as Supercache Master
+    participant S as Supercache Store
+    rect rgb(240, 245, 255)
+        YC->>YW: 申请或准备对象空间（控制）
+        YW-->>YC: 目标空间与 UB 信息
+        YC->>YW: UB WRITE 数据
+        YC->>YW: Publish（控制）
+        YW-->>YC: 发布结果
+    end
+    rect rgb(240, 255, 245)
+        C->>M: PutStart（控制）
+        M-->>C: 副本地址
+        C->>S: TE WRITE 数据
+        C->>M: PutEnd 或 PutRevoke（控制）
+        Note over M,S: Master 协调分配与确认，Store 承载数据
+    end
 ```
 
 Supercache 的分配和确认主要与 Master 交互，目标 Store 通常不执行每次 WRITE 对应的对象级 Publish RPC。当前 `Put()` 遇到 OBJECT_ALREADY_EXISTS 返回成功且不覆盖旧值，更新有独立 `Upsert()` 路径；迁移 yuanrong SET 时须按存在性/覆盖语义选择 API。故障 gate 必须同时覆盖 Put/Upsert，而非只拦截一种写入口。
@@ -36,13 +50,27 @@ Supercache 的分配和确认主要与 Master 交互，目标 Store 通常不执
 
 ### 0.3 GET：Worker WRITE 回写变为 Client 主动 READ
 
-```text
-yuanrong 典型 UB GET：
-Client 发 Get/QueryAndGet 并提供 buffer → Worker UB WRITE 回 Client → Worker 返回业务结果
-
-Supercache 远端内存 GET：
-Client 查询 Master 副本 → Client TE READ 远端 Store 到本地
-→ Client 检查传输、校验和与读取 lease
+```mermaid
+sequenceDiagram
+    participant YC as yuanrong Client
+    participant YW as yuanrong Worker
+    participant C as Supercache Client / TE
+    participant M as Supercache Master
+    participant S as Supercache Store
+    rect rgb(240, 245, 255)
+        YC->>YW: Get / QueryAndGet，提供接收 buffer
+        YW->>YC: Worker 发起 UB WRITE 数据回写
+        Note over YW: Worker 提交 WR、处理 CQE
+        YW-->>YC: GET 业务结果，可附健康摘要
+    end
+    rect rgb(240, 255, 245)
+        C->>M: 查询副本（控制）
+        M-->>C: 副本地址与 lease
+        C->>S: Client 发起 TE READ 请求
+        S-->>C: READ 数据返回（硬件数据流）
+        Note over C: Client 处理 CQE，检查结果与 lease
+        Note over C,S: 数据阶段没有对应的对象级 GET 响应，健康走独立控制 Query
+    end
 ```
 
 前者由 Worker 提交 WR、处理 CQE，业务响应可携带健康摘要；后者通常由请求侧 Client 的实际 TE 执行者提交 READ、处理 CQE，数据阶段没有对应的对象级 Worker 响应。READ 的数据流是 Store → Client，但“本地”仍指提交 WR、接收 CQE 的一方，不随数据方向翻转。存在 TE 代理时以实际执行进程为准，再向业务调用方映射错误。
@@ -291,88 +319,196 @@ CVM 节点向现有 Master 视图中的参与者同步，视图变化重新同�
 
 ### 3.3 Use Case 时序设计
 
-CQE 当前操作处理与后台健康核验并行，不能等待查询健康后把失败改成成功。远端 Query 的 PENDING/稳定下界流程见 3.2.5。
+图中 H 表示本地域 Monitor，A 表示本地 NodeBusinessAdmission，R 表示消费者自己的 NodeHealthRegistry。四口全坏先关闭该域；只有全部配置域确认不可用才关闭节点 gate。隔离生效于各消费者确认后的新准入，不代表全局瞬时撤销已发出的单边 DMA。
 
-#### 3.3.1 UC-1 PUT / WRITE E4
+CQE 失败处理与健康核验异步进行，当前操作不能因后续端口健康而变为成功。Query 的 PENDING/稳定下界流程见 3.2.5；以下聚焦隔离建立后的业务行为。
+
+#### 3.3.1 UC-1 PUT / WRITE E4：本地关闭后拒绝新业务
 
 ```mermaid
 sequenceDiagram
-    participant C as Client WRITE
+    participant B as 业务调用方
+    participant C as Client / TE
     participant O as 原 operation owner
     participant H as 本地域 Monitor
-    C->>O: 当前操作失败，保留在途责任
-    C->>H: E4 本地核验触发
-    H->>H: 本地 user_ctl 查询四口
-    H-->>C: 全坏才关闭域，聚合节点 gate
-    Note over O,H: 端口健康也不把失败 WRITE 改为成功
-```
-
-#### 3.3.2 UC-2 GET / READ E4
-
-```mermaid
-sequenceDiagram
-    participant C as Client READ
-    participant O as 原 operation owner
-    participant H as 本地域 Monitor
-    C->>O: 失败，结果无效，禁止成功 H2D
-    C->>H: E4 只触发本地核验
-    H-->>C: 更新后续准入
-    O-->>C: 真实 WR 安全收敛
-    Note over C,H: 重试检查注册和 lease，本地隔离不能换源绕过
-```
-
-#### 3.3.3 UC-3 PUT / WRITE E9
-
-```mermaid
-sequenceDiagram
-    participant C as Client WRITE
-    participant L as 本地 Monitor
-    participant S as Store 控制面与 Monitor
-    participant M as Master
-    C->>C: 失败，保留可能写入，不自动重放
-    par 本端核验
-        C->>L: 异步本地刷新
-        L->>L: 查询自身 context
-    and 对端核验
-        C->>S: 独立 Query 触发并按稳定下界取结果
-        S->>S: 查询 Store 自身 context
-        S-->>C: 有效四口事实或 PENDING/失败
+    participant A as 本地 Admission
+    C->>O: WRITE E4，标记失败并保留在途责任
+    C->>H: 异步触发本地四口查询
+    H->>H: 本地 user_ctl 核验
+    H->>A: 发布域事实，聚合全部配置域
+    alt 全部配置域有效不可用
+        A->>A: 关闭节点 gate，递增 admission epoch
+        A-->>C: 通知停止未 post 阶段
+        C->>C: 取消未提交工作，禁止新窗口和新 grant
+        B->>C: 后续 Put / Upsert / Get 或缓存快速路径
+        C->>A: 获取本地节点许可
+        A-->>C: 拒绝 NODE_DATA_ISOLATED
+        C-->>B: 返回隔离错误，不切 TCP / memcpy 绕过
+    else 至少一个域可服务
+        A-->>C: 节点不隔离，仅过滤不可用域
+        Note over C,H: 当前 E4 仍是失败，检查注册、地址与权限
+    else 查询失败或证据不足
+        A->>A: 保留此前确认状态，不新建或解除隔离
     end
-    Note over C,S: 各自确认全域不可用才隔离各自节点
-    S-->>M: 摘要变化提示
-    M->>S: 独立核验后过滤新分配
+    O->>O: 已 post WR 按真实完成安全收敛
+    C->>C: 按现有 PUT 失败路径撤销未成功分配
+    Note over B,O: 控制结算继续，失败前缀不发布成功，也不自动重放 WRITE
 ```
 
-#### 3.3.4 UC-4 GET / READ E9
+如果该 Client 同时承载 segment，本地节点关闭覆盖其请求方与数据持有方角色；远端消费者仍须独立核验后更新自己的过滤视图。
+
+#### 3.3.2 UC-2 GET / READ E4：不能用换源绕过本地隔离
 
 ```mermaid
 sequenceDiagram
-    participant C as Client READ
-    participant L as 本地 Monitor
-    participant S as Store 控制面与 Monitor
-    C->>C: 当前内容无效，保留旧 WR 责任
-    C->>L: 本地核验
-    C->>S: 独立 Query，Store 查询自身
-    S-->>C: 有效事实或待核验
-    C->>C: 分别更新本地和远端准入
-    Note over C,S: 旧 WR 收敛且 lease/注册有效后才可重读或换源
+    participant B as 业务调用方
+    participant C as Client / TE
+    participant O as 原 operation owner
+    participant H as 本地域 Monitor
+    participant A as 本地 Admission
+    C->>O: READ E4，结果无效，禁止成功 H2D
+    C->>H: 只触发本地端口核验
+    H->>A: 发布有效域事实并聚合
+    alt 全部配置域不可用或本地已确认隔离
+        A->>A: 关闭或保持节点 gate
+        C->>A: 重读、换源或新窗口前申请许可
+        A-->>C: 拒绝
+        C-->>B: 读取失败，后续新数据返回隔离错误
+        Note over C,A: 即使其他 Store 健康，也不能绕过本地 gate
+    else 本地可服务且注册与 lease 有效
+        O->>O: 原操作及关联 WR 安全收敛
+        C->>A: 新 READ 重新获取许可
+        A-->>C: 允许后续合法读取
+        Note over C,O: 旧操作可能写入期间，不让新 READ 复用同一 buffer
+    end
+    O->>O: 保留实际 buffer / MR / batch 至可安全释放
+    Note over B,H: 端口健康不改写当前失败结果，失败内容不交付业务
 ```
 
-#### 3.3.5 UC-5 后台任务与恢复
+#### 3.3.3 UC-3 PUT / WRITE E9：两端分别隔离，Master 避让新分配
+
+```mermaid
+sequenceDiagram
+    participant C as Client / TE
+    participant A as Client 本地 Admission / Monitor
+    participant S as Store Admission / Monitor
+    participant R as Client Peer Registry
+    participant M as Master / Registry
+    C->>C: 当前 WRITE 失败，保留可能已写入，不自动重放
+    par 本端核验
+        C->>A: 本地刷新
+        A->>A: 查询自身 context，聚合本地准入
+    and 对端核验
+        C->>S: 控制 Query 触发对端本地查询
+        S->>S: 查询自身 context，聚合 Store 准入
+        S-->>R: 返回同身份有效事实或 PENDING / 失败
+    end
+    opt Client 全部服务域确认不可用
+        A->>A: 关闭本地节点 gate
+        A-->>C: 拒绝后续数据、重试和新 grant
+    end
+    opt Store 全部服务域确认不可用
+        S->>S: 关闭自身新数据 gate，保留控制服务
+        R->>R: 独立 Query 确认后关闭该 Store 的远端准入
+        C->>R: 检查缓存目标或已取得的 PutStart 结果
+        R-->>C: 拒绝后续新提交，不沿旧描述符继续写
+        S-->>M: 发送变化摘要，仅作核验线索
+        M->>S: 独立 Query
+        S-->>M: 返回有效不可用事实
+        M->>M: Registry 确认隔离，过滤后续分配候选
+        M->>M: 实际分配提交前再次复查身份与准入
+    end
+    Note over C,M: 未 post 部分走既有撤销，已 post 保留 owner；PutEnd / abort 控制结算继续
+    Note over C,S: 双方有健康域不建立端口隔离；查询失败不等于四口全坏
+```
+
+隔离不删除节点、segment、对象或副本，不自动迁移。Client 与 Master 的确认存在传播间隔，双方必须各自执行最终准入；一方确认不能替另一方建立健康事实。
+
+#### 3.3.4 UC-4 GET / READ E9：隔离读源后过滤缓存并换健康副本
+
+```mermaid
+sequenceDiagram
+    participant B as 业务调用方
+    participant C as Client / TE
+    participant A as Client 本地 Admission / Monitor
+    participant S as Store Admission / Monitor
+    participant R as Client Peer Registry
+    participant O as 原 operation owner
+    C->>O: 当前 READ 失败，内容无效，保留旧 WR 责任
+    par 本端核验
+        C->>A: 本地 Query，更新自身准入
+    and 对端核验
+        C->>S: 独立 Query，Store 查询自身 context
+        S-->>R: 同身份有效事实或待核验
+    end
+    opt Store 全域确认不可用
+        S->>S: 关闭本地新数据 gate
+        R->>R: 独立确认后过滤该读源及缓存 descriptor
+    end
+    alt Client 本地已隔离
+        C->>A: 申请重读或换源许可
+        A-->>C: 拒绝
+        C-->>B: 本地隔离，禁止换源绕过
+    else Client 可服务
+        O->>O: 原操作及关联 WR 安全收敛
+        C->>R: 按原副本策略过滤已隔离读源
+        alt 有健康副本且 lease / 注册有效
+            R-->>C: 返回合法候选
+            C->>C: 取得节点、路径和 Jetty 许可后提交新 READ
+        else 对象存在但无可服务副本
+            C-->>B: NODE_DATA_UNAVAILABLE
+            Note over B,R: 不返回 OBJECT_NOT_FOUND，不形成负缓存，不删除副本
+        end
+    end
+    Note over C,S: Query 失败保持旧确认状态；端口健康也不使本次 READ 成功
+```
+
+#### 3.3.5 UC-5 后台任务与恢复：停止新阶段，独立核验后重新开放
+
+后台 Copy/Move 需要在任务出队、重试和新传输阶段检查双方，不能只在任务创建时检查。
+
+```mermaid
+sequenceDiagram
+    participant T as Copy / Move 执行器
+    participant A as 源节点本地 Admission
+    participant R as 目标 Peer Registry
+    participant O as 原 operation owner
+    T->>A: 出队或重试时检查源节点
+    T->>R: 检查目标节点确认视图
+    alt 源或目标已确认隔离
+        T->>T: 停止未 post 阶段、窗口和新 grant
+        T->>O: 保留已 post 部分，等待安全收敛
+        T->>T: 通过既有控制流程上报失败或撤销
+        Note over T,O: 目标失败不提前删除源副本，不因隔离释放 DMA 缓冲
+    else 双方可服务
+        T->>T: 最终提交前再次获取节点、路径和 Jetty 许可
+        T->>T: 数据成功且提交完成后，才变更副本状态
+    end
+```
+
+恢复只开放后续合法操作，不复活失败任务或退役资源。
 
 ```mermaid
 sequenceDiagram
     participant H as 故障侧 Monitor
     participant A as 本地 Admission
-    participant R as 远端消费者
-    H->>H: 每秒查询，bad 从 4 降至 3
-    H->>A: 解除域端口隔离，聚合节点状态
-    A-->>R: 变化摘要，仅触发核验
-    R->>H: 独立 Query
-    H-->>R: 同身份有效可服务事实
-    R->>R: 解除端口隔离，停止远端恢复轮询
-    H->>H: 本地继续查询直到 bad=0 才停止
-    Note over H,R: fatal 另判，旧任务和旧 Jetty 不因恢复而复活
+    participant R as Master / Client Registry
+    participant B as 业务分配或副本选择
+    H->>H: 每秒查询，域 bad 从 4 降至 3
+    H->>A: 有效事实覆盖最新异常
+    alt 至少一个配置域可用且资源在线
+        A->>A: 解除节点隔离，更新 epoch，进入 DEGRADED
+        A-->>R: 恢复摘要，仅触发核验
+        R->>H: 独立 Query，验证身份、集合与新鲜性
+        H-->>R: 返回有效可服务事实
+        R->>R: 解除消费者隔离，停止远端恢复轮询
+        B->>R: 后续分配或副本选择
+        R-->>B: 允许参与，实际提交仍复查准入
+    else 仍无可用域或资源 fatal 未修复
+        A->>A: 保持节点关闭，不因端口部分 GOOD 强行开放
+    end
+    H->>H: 本地继续每秒查至 bad=0 才停止周期轮询
+    Note over H,R: Query 失败或旧身份保持关闭；旧 WR / Jetty 按原生命周期结算
 ```
 
 ### 3.4 核心类与数据结构
