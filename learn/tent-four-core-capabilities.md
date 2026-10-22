@@ -1,662 +1,559 @@
-# TENT 四项核心能力的代码实现原理
+# TENT 四项核心能力：物理 UB 分片与 bonding 能力对照
 
-## 1. 分析基线与阅读范围
+> 更新日期：2026-10-22。
+> Supercache 分析快照：`main_learn`，`a1784076bac3f0901af353d062d33ee5c8078cec`。
+> 同级 UMDK 分析快照：`09086da5d86c53f83eb395109d636957d3efcc79`。
+> 本文以 CPU DRAM 上的普通单边 READ/WRITE 为主，区分当前实现与待实现方案；不代表已经通过真实 UB 性能或故障测试。
 
-- 分析日期：2026-10-20。
-- 基线提交：`d855a6aed9c8d1343af008b2cd9b9f4257d62a9b`。
-- 写作分支：`main_learn`。
-- 分析对象：`mooncake-transfer-engine/tent/` 下的原生 TENT 实现。
-- 本文通过静态阅读代码说明机制；没有执行硬件吞吐测试、故障注入或完整 C++ 测试。
+## 1. 先看 TENT 如何把一次读写分给物理 UB 设备
 
-本文展开四项能力：按请求选择 transport、将大传输切片并调度到多个 rail、通过中转内存组织 staged transfer、在运行时处理可恢复故障。
+### 1.1 一单运输任务，拆成多个独立包裹
 
-TENT 是 Transfer Engine NEXT。它接收内存或文件位置上的传输请求，并组织实际数据搬运。Mooncake Store 的对象路由、缓存淘汰和副本策略位于更高层，不能与这些传输机制混为一谈。
+把物理 UB 设备想成运输站点，设备之间可达的路径想成运输通道。应用给 TENT 一单任务，TENT 把它拆成多个 slice，每片再转换成设备执行的 WR。
 
-为避免把设计目标当成已经实现的通用能力，本文特别区分：
+| 对象 | 通俗理解 | 当前代码中的作用 |
+| --- | --- | --- |
+| Request / Task | 一单完整运输任务 | 记录本地地址、远端 Segment、远端地址、长度和最终状态 |
+| Slice | 任务中的一个包裹 | 有独立地址范围、重试次数和状态 |
+| Attempt | 这个包裹的某次投递 | 记录本次路径和尝试编号，隔离迟到完成 |
+| WR | 交给设备的一张作业单 | 携带 READ/WRITE、SGE、长度和完成 token |
+| Context / Jetty | 某个站点的设备资源与通信端点 | 属于具体本地设备/EID，不能跨设备随意混用 |
+| JFC / CR | 完成队列与具体回执 | 告知某次作业成功、超时或报错 |
 
-1. runtime 层的 transport 选择与 transport 内部的设备选择。
-2. 已编码的 staging 模式与任意路径自动搜索。
-3. 失败驱动的恢复与“链路只是慢了”的性能调度。
-4. RDMA 的具体算法与 UB 的另一套实现。
-
-文中的 `路径:行号` 均针对上述基线，之后代码变更可能使行号偏移。以 `tent/` 开头的路径相对于仓库内的 `mooncake-transfer-engine/`；文末提供完整源码路径。源码片段和伪代码会明确区分。
-
-## 2. 先建立整体调用模型
-
-### 2.1 从 Request 到物理工作请求
-
-主要抽象如下：
-
-| 抽象 | 对应内容 | 主要用途 |
-|---|---|---|
-| `Request` | opcode、本地指针、目标 Segment、目标位置、长度、优先级、hint、deadline、intent | 描述一次逻辑搬运 |
-| `SegmentDesc / BufferDesc` | 注册内存范围、位置、可用后端及后端属性、拓扑 | 判断地址属于哪里，怎样访问 |
-| `Batch / TaskInfo` | 面向调用方的一批请求及各请求运行状态 | 关联状态、恢复预算与生命周期 |
-| `SubBatch` | 某个 transport 实际接收的一组任务 | runtime 与后端的边界 |
-| RDMA/UB Slice | 一次逻辑请求拆成的较小执行单元 | 分流、重试和完成统计 |
-| RDMA WR / URMA WR | 最终提交给设备的工作请求 | 执行具体的数据读写 |
-
-请求语义尤其容易误解：
-
-- `WRITE`：从本地 `source` 写入 `<target_id, target_offset>`。
-- `READ`：从 `<target_id, target_offset>` 读取到本地 `source`。
-- 因此，`READ` 的 `source` 实际是本地接收指针。
-- 对内存 Segment，实际查找使用远端注册地址范围；`target_offset` 应理解为目标地址值，不应一律填成从零开始的数组下标。文件场景则有相应的文件位置语义。
-
-源码入口：`tent/include/tent/common/types.h` 中的 `Request`；`tent/src/runtime/transfer_engine_impl.cpp` 中的 `getTransportType()`、`prepareSubmit()`。
-
-### 2.2 一次提交的大体路线
+`WRITE` 将本地 `Request.source` 写到远端 `target_offset`；`READ` 则从远端 `target_offset` 读到本地 `source`。因此 READ 的 `source` 是本地接收地址。本文内存场景中的 `target_offset` 按远端注册地址值理解，不是默认从零开始的数组下标。
 
 ```mermaid
 flowchart TD
-    A["submitTransfer：一组 Request"] --> B["prepareSubmit：校验、边界与合并、路由"]
-    B --> C{"需要 staging？"}
-    C -->|是| D["ProxyManager：拆成多个 stage / chunk"]
-    C -->|否| E["按 transport 和策略组织 SubBatch"]
-    D --> E
-    E --> F["RDMA / UB / TCP 等后端"]
-    F --> G["后端切片、设备选择、提交、完成处理"]
-    G --> H["状态查询 / progressBatch"]
-    H --> I{"可恢复的 FAILED？"}
-    I -->|是| J["在预算内尝试下一候选 transport"]
-    J --> E
-    I -->|否| K["返回 PENDING 或终态"]
+    App["应用：提交一个 192 KiB WRITE"] --> Runtime["TENT runtime：选择 UBTransport"]
+    Runtime --> Split["按有效 slice_size 拆分；假设为 64 KiB"]
+    Split --> S0["S0：偏移 0，长度 64 KiB"]
+    Split --> S1["S1：偏移 64 KiB，长度 64 KiB"]
+    Split --> S2["S2：偏移 128 KiB，长度 64 KiB"]
+    S0 --> Scheduler["每个 slice 独立选路并预留配额"]
+    S1 --> Scheduler
+    S2 --> Scheduler
+    Scheduler --> A["物理设备 A：Context_A / Jetty_A"]
+    Scheduler --> B["物理设备 B：Context_B / Jetty_B"]
+    A --> Memory["同一块远端注册内存的不同地址区间"]
+    B --> Memory
 ```
 
-这张图省略了可选 admission queue。当前 `enable_runtime_queue` 默认关闭；开启时，请求可以先排队，再由 progress worker 派发。它与后端切片调度属于不同层次。
+这张图表示允许的分流方式，不保证每次均分。TENT 会综合拓扑、配额、在途负载、Endpoint 状态和带宽样本选择路径。
 
-源码定位：`tent/src/runtime/transfer_engine_impl.cpp:396`、`:2091`、`:2217`、`:2772`。
+### 1.2 分片大小如何确定
 
-## 3. 能力一：按请求动态选择传输方式
+当前 UB 的 `slice_size` 默认是 `64 * 1024` 字节。初始化时，TENT 遍历所选设备，把它收紧到这些设备上报的非零能力限制之内：
 
-### 3.1 选择依据来自三部分
-
-第一部分是请求本身，包括大小、优先级、业务意图、指定策略名与 transport hint。
-
-第二部分是 Segment 元数据。引擎通过 `SegmentManager` 获取本地或远端缓存描述，再用 `findBuffer(target_offset, length)` 定位注册内存，取得远端内存类型、transport 标签和机器标识等。
-
-第三部分是本地运行时能力：后端是否已经安装，以及后端 `capabilities()` 能否完成 CPU、设备内存或文件之间的相应拷贝。
-
-因此，仅在配置中写出 `"rdma"` 或 `"ub"` 并不足以保证传输能够成功；实际设备、注册资源和端点仍需满足后端要求。
-
-源码定位：`tent/src/runtime/transfer_engine_impl.cpp:1526`；`tent/src/runtime/transport_selector.cpp:462`。
-
-### 3.2 先匹配策略，再挑候选
-
-`TransportSelector::matchesPolicy()` 支持以下条件：
-
-- `segment_type`：内存或文件。
-- `same_machine`：是否属于同一台机器。
-- `local_memory / remote_memory`：内存类型。
-- `min_size / max_size`：请求大小范围。
-- `priority`：优先级精确匹配。
-- `intent_type`：前台读取、后台预取、迁移、checkpoint 等。
-
-`select()` 按 JSON 顺序寻找第一个匹配策略，然后使用其 `transports` 顺序。
-
-```cpp
-// 简化伪代码；并非可直接替换源码的实现。
-policy = first_matching_policy(context);
-raw_candidates = policy.transports.empty()
-    ? context.buffer_transports
-    : policy.transports;
-candidates = reorder_with_hint(raw_candidates, request.transport_hint);
-selected = nth_available_transport(candidates, transport_index);
+```text
+有效 slice_size = min(
+    配置的 slice_size,
+    各设备非零的 max_message_size,
+    各设备非零的 max_read_size,
+    各设备非零的 max_write_size
+)
 ```
 
-没有显式策略时，`getTransportType()` 还保留 legacy 选择路径：内存请求主要依据 buffer 上的 transport 顺序，文件请求考虑 GDS/IOURING。不要假设所有请求都经过完全相同的策略分支。
+这是当前代码使用的共同上限，同时考虑 READ 和 WRITE；不是按每个 opcode、每条路径单独选择最大长度。设备能力值为零时，这里不据此收紧，不能把零直接解释成实际无限支持。
 
-`policy_name` 是另一种显式绑定：匹配到相同名称和 Segment 类型后，会绕过该策略其他匹配条件。它与普通的“按 intent 等字段匹配”语义不同。
+提交长度为 L 的非空请求时：
 
-源码定位：`tent/src/runtime/transport_selector.cpp:396`、`:529`；`tent/src/runtime/transfer_engine_impl.cpp` 的 legacy 分支。
-
-### 3.3 transport_hint 的真实边界
-
-当前基线中，`transport_hint` 不是绕过候选集的任意后端选择权。
-
-`reorderWithHint()` 的核心代码为：
-
-```cpp
-if (hint == UNSPEC) return raw;
-if (std::find(raw.begin(), raw.end(), hint) == raw.end()) {
-    return std::nullopt;
-}
+```text
+片数 = ceil(L / 有效 slice_size)
+每片长度 = min(有效 slice_size, 剩余长度)
+本地地址 = Request.source + 片内起始偏移
+远端地址 = Request.target_offset + 同一偏移
 ```
 
-只有 hint 已在候选集中，才把它移到队首。其余候选保留相对顺序，并排除重复的 hinted transport。
+例如有效大小为 64 KiB，一次 150 KiB WRITE 拆成 64、64、22 KiB 三片。UB 当前不会套用 RDMA 的小尾片合并算法。片数超过 `max_slices_per_task` 会拒绝提交，默认上限是 65536 片。
 
-例如，策略为 `["rdma", "tcp"]`：
+源码：[T1] `UbTransport::install()`、`submitTransferTasks()`；[T2] `UbParams`；[T3] `convertCapabilities()`。
 
-| hint | 结果 |
-|---|---|
-| `UNSPEC` | 按 RDMA、TCP 顺序 |
-| `TCP` | 候选顺序变成 TCP、RDMA |
-| `UB` | 不在候选集中，拒绝该选择 |
+### 1.3 slice 大小不等于线上包大小
 
-在 selector 模式下，若 hint 对应的首选后端不可用，初次选择会失败，不会直接悄悄跳过它。后续任务能否恢复，还需结合提交状态、候选集与 failover 逻辑判断。
+需要分清三个层次：
 
-另外，`validateTransportHint()` 在 prepare 阶段校验枚举范围和后端是否安装。这与后面的策略授权、内存能力检查是不同步骤。
+| 长度 | 例子 | 由谁决定 |
+| --- | --- | --- |
+| 应用请求长度 | 一次 WRITE 1 MiB | 应用 |
+| Slice / WR 长度 | 每片 64 KiB，或者被能力限制收紧 | TENT 与设备能力 |
+| 实际线上报文长度 | 底层分包后的报文 | 协议、provider、设备与链路配置 |
 
-源码定位：`tent/src/runtime/transport_selector.cpp:608`；`tent/src/runtime/transfer_engine_impl.cpp:1507`。
+UMDK 的聚合设备说明列出过 CTP 多路径的 `Max Send Pkt Size = 4 KB`、RTP 单路径的 `64 KB`。这是相应设备/版本的规格，不能直接当作所有物理设备的 READ/WRITE 上限，也不能用它直接计算线上包数。当前 TENT 依据查询结果切片，没有写死“CTP 一律 4 KB”。参考 [U8]。
 
-### 3.4 “可用”比“已安装”多一层
+若最终有效 slice 分别是 4 KiB、64 KiB，同一个 1 MiB 请求会产生 256、16 片；这是 TENT 切片数量，不是抓包得到的报文数量。
 
-`isTransportAvailable()` 不只检查指针是否存在：
+### 1.4 每一片真正执行了什么
 
-- NVLINK、SHM、TPU 要求同机。
-- XPU、MLU 的本地拷贝要求同一进程的本地 Segment。
-- CPU→CPU 要求 `dram_to_dram`。
-- CPU→设备要求 `dram_to_gpu`。
-- 设备→CPU 要求 `gpu_to_dram`。
-- 设备→设备要求 `gpu_to_gpu`。
-- 文件读写要求相应文件能力。
-- XPU/MLU 的 host-staging 分支把网络 hop 按 CPU→CPU 检查，并限制为代码允许的网络后端。
+以 WRITE 为例，当前 Worker 的主要流程如下：
 
-这些检查避免把一个本地地址拷贝后端当成跨节点网络后端。
+1. 从元数据中定位远端缓冲区和各设备的注册描述。
+2. 枚举本地设备与远端设备组合，排除不可用 Context、暂停路径和不允许的设备。
+3. 对候选排序，按需获取或建立 Endpoint，并原子预留设备/路径配额。
+4. 在选中的本地 Context 查找本地注册 Segment，导入或复用该路径的远端 Segment。
+5. 生成本次 attempt 和 completion token，持有 Endpoint、Segment 等资源引用。
+6. 构造一条普通 URMA READ/WRITE WR，当前 Worker 每次提交一条。
+7. 后台 poller 轮询 JFC，根据 token 找到这次投递，释放记账并推进 slice 状态。
+8. 全部分片成功，整任务才变成 `COMPLETED`；中间失败可能先进入有界重试。
 
-### 3.5 设备 mask 与分组提交
+数据面实际调用 `urma_post_jetty_send_wr()` 和 `urma_poll_jfc()`。建链使用 `urma_import_jetty()`、`urma_bind_jetty()`；内存导入最终使用 `urma_import_seg()`。直接物理设备与 bonding 设备都可沿用这些 URMA API，具体句柄和 provider 行为不同。[T3][T4][T5]
 
-策略中的 `devices` 会在绑定拓扑时解析为 `device_mask`，避免每次请求都重复解析名称。
+### 1.5 顺序、完整性与重试必须分开理解
 
-当前实现有一个需要明确的行为：如果策略列出的设备名全部无法解析，会记录错误并放宽为所有设备；它不是严格的“名称错误就禁止传输”过滤器。不要用它代替需要严格保证的隔离机制。
+```mermaid
+sequenceDiagram
+    participant T as TENT
+    participant A as 物理设备 A
+    participant B as 物理设备 B
+    participant M as 远端目标内存
+    T->>A: S0：写 P 起始的区间
+    T->>B: S1：写 P + 64 KiB 起始的区间
+    B->>M: S1 先执行
+    B-->>T: S1 成功
+    A->>M: S0 后执行
+    A-->>T: S0 成功
+    Note over T,M: 不同偏移直接定位，不需要按到达顺序拼接
+    T->>T: 所有 slice 成功后，整任务成功
+```
 
-runtime 随后把 RDMA/UB owner 按 `device_mask`、`qp_pool` 组织同质提交组；RDMA 使用 QP pool，UB 的 QP pool 行为不能直接类比 RDMA。
+不同分片的完成顺序可以不同，当前实现没有建立跨设备的全局顺序屏障。对互不重叠的地址区间，乱序本身不会改变最终内存布局，但还需要满足：源数据在传输及重试期间稳定，目标范围有合适的写入所有权，底层成功完成语义成立。
 
-源码定位：`tent/src/runtime/transport_selector.cpp` 的 `resolveDeviceMasks()`；`tent/src/runtime/transfer_engine_impl.cpp:2327`。
+不能据此承诺：
 
-### 3.6 示例配置及其含义
+- 整个大 WRITE 原子生效。某片失败时，之前写入的片不会回滚。
+- 接收方随时读取都能看到完整对象。必须等全部成功后，通过正确的可见性与发布协议让读者消费。
+- 并行 READ 自动得到一致快照。远端数据并发变化需要上层版本/同步机制。
+- 一次超时意味着远端未执行。旧写可能已生效，重试可能再次写入。
+- 收到成功 CR 就额外获得了端到端校验。当前路径没有整对象校验和接收方确认协议。
 
-以下是策略结构示例，假设所需后端已编译并启用，内存也已注册：
+当前 `UbTask::maybeFinalizeLocked()` 等待所有 slice 终结，只有全成功才报告 `COMPLETED`。[T6] 这是一条完成汇总规则，不能替代 provider 的可靠性语义。尤其不能仅凭 `RC` 名称，推断所有 `RC + CTP` 组合都有 RTP 同等的确认、重传能力。
+
+## 2. TENT 与 bonding 分别在哪一层工作
+
+### 2.1 不使用 TENT，直接调用物理 URMA
+
+```mermaid
+flowchart LR
+    App["应用：选择设备、管理连接、分配 WR、处理完成和恢复"]
+    App --> A["物理 Context_A / Jetty_A / JFC_A / Segment_A"]
+    App --> B["物理 Context_B / Jetty_B / JFC_B / Segment_B"]
+```
+
+用户表格中的“应用自行管理”，在接入 TENT 后，大部分变成了“由 UBTransport 替应用管理”。因此不能拿“裸用物理设备缺什么”，直接推导出“TENT 也缺什么”。
+
+### 2.2 TENT 直接管理物理设备
+
+```mermaid
+flowchart TD
+    App["应用：逻辑 Segment、Request、Batch、Task 状态"] --> Runtime["TENT runtime：选择 transport；必要时编排 staging"]
+    Runtime --> UB["UBTransport：切片、选路、配额、重试、完成汇总"]
+    UB --> CA["Context_A：Jetty / JFC / 本地与远端 Segment"]
+    UB --> CB["Context_B：Jetty / JFC / 本地与远端 Segment"]
+    CA --> PA["物理 URMA provider A"]
+    CB --> PB["物理 URMA provider B"]
+```
+
+bonding 则在更低的 provider 层，用虚拟 URMA 资源包装多套物理资源。两者可以覆盖相似职责，但不要求暴露相同对象：TENT 可以统一逻辑任务，而不创建一个新的 bonding EID 或虚拟 URMA JFC。
+
+### 2.3 保留原来“四项核心能力”的定位
+
+TENT 是 Transfer Engine NEXT。四项能力与本文主线的关系如下：
+
+| 核心能力 | 实现位置 | 与物理 UB 的关系 |
+| --- | --- | --- |
+| 按请求选择 transport | `TransportSelector`、`TransferEngineImpl` | 在 UB、RDMA、TCP 等可用候选中选择；不等于同时使用所有 transport |
+| 切片与多 rail 调度 | 各 transport 的 Workers、Quota、Slice | 本文重点；UB 有自己的评分与资源管理，不能套用 RDMA 算法 |
+| 通过中转缓冲组织 staging | `ProxyManager` | 需要时先组织设备/主机拷贝，再把网络阶段交给后端；不是任意多跳图搜索 |
+| 故障处理与恢复 | transport 内部与 runtime 两层 | UB 可重试 slice；后端任务失败后，runtime 在条件与预算内尝试其他候选 |
+
+staging chunk 与 UB slice 也不是同一粒度。前者用于多阶段流水线和缓冲复用，后者用于具体设备上的传输、配额与重试。
+
+本文后续只讨论 UBTransport 能否承担表格中的职责，不将其他后端的主动探测或排序实现算作 UB 已有能力。[T10]
+
+## 3. 十项能力总览：裸物理设备与 TENT 接入后不同
+
+“已有”表示当前代码有相关机制，不表示与 bonding 的所有模式等价，更不代表已完成真实硬件验收。
+
+| 功能 | bonding 实现的部分 | 裸用物理 URMA 时调用方承担 | 接入 TENT 后的判断 |
+| --- | --- | --- | --- |
+| 统一设备身份 | 一个 bonding EID 隐藏成员 EID 和拓扑 | 选择设备和 EID | 逻辑 Segment/Task 已隐藏应用侧设备选择；无需再造 bonding EID |
+| 资源虚拟化 | 虚拟 Context/Jetty/JFC/Segment 展开到物理资源 | 分设备管理句柄与生命周期 | TENT 已管理多套资源；无需复制虚拟句柄层 |
+| 拓扑选路 | 聚合 EID 展开成可通信路径 | 明确物理 EID 的可达关系 | 已有候选与选路；精确可达性、profile 和故障域仍需增强 |
+| 带宽聚合 | Balance 在成员路径间分配工作 | 自行调度多设备 | 已有逐 slice 分流；不保证均分或达到带宽之和 |
+| 主备切换 | 在支持的配置下保存 WR、故障换路重发 | 准备备路并处理重试 | 已有错误分类、分片重试与排空；严格主备策略及重放契约待增强 |
+| 健康检查、故障回切 | 周期探测、重建 Jetty、恢复路径 | 自行检测和恢复 | 有被动反馈、冷却与按需重建；主动探测和完整回切需要补齐 |
+| 软件 RNR 重试 | 硬件 RNR 耗尽后软件再提交 | 硬件处理后自行决策 | 耗尽错误已有通用重试；专用退避与流控尚缺 |
+| 完成和事件聚合 | 汇集 JFC/JFCE、恢复虚拟身份和 user_ctx | 分别处理完成与事件 | 完成汇总已有；JFCE 事件等待尚未完整接入 |
+| MSN 去重 | 对支持 MSN 的接收消息过滤重复完成 | 自行定义消息身份与去重 | 普通 READ/WRITE 不适用；未来 SEND/通知需要等价机制 |
+| Segment 导入缓存 | 缓存聚合 Segment 的物理展开描述 | 保留或缓存物理导入句柄 | 已有按设备与 generation 区分的句柄缓存 |
+
+注意：这是 bonding 能力类别的对照，不是当前 TENT 使用 bonding 时的默认行为清单。当前 Adapter 对 bonding Context 设置 `STANDALONE + IODIE`，不能把假设的 Balance/Active-Backup 能力直接算作本项目默认基线。[T3] bonding 的健康检查、回切、软件 RNR、MSN 还受版本、资源类型和开关约束。[U1][U3][U4]
+
+## 4. 逐项解释实现原理与边界
+
+### 4.1 统一设备身份：应用认识目标，不必认识每个窗口
+
+bonding 给调用方一个聚合 EID；TENT 给应用的是逻辑 Segment、地址范围和任务 ID。应用提交同一个请求时，具体由哪个本地设备访问哪个远端设备，可在 UBTransport 内选择。
+
+当前发现逻辑枚举设备 EID；不同 EID 可以形成不同拓扑 NIC，并按设备及 EID index 创建原生 Context。EID 描述进入元数据与 Bootstrap，而不要求应用每次读写自己挑选。[T3][T9]
+
+**为何无需复制：** 统一应用入口已经存在，没必要仅为隐藏物理 EID 再发明一个虚拟 EID。
+
+**仍需增强：** 同一物理设备的两个 EID 不等于两个独立设备；device/EID index 也不能替代跨重启稳定身份。故障域、实例 epoch、双端可达性需要显式表达，见第 7 节。
+
+### 4.2 资源虚拟化：TENT 已经是资源管理员
+
+TENT 为所选设备/EID 管理 `UbContext`、`UbJfc`，通过 `EndpointStore` 持有 Jetty 连接，通过 `UbBufferManager` 管理注册与导入资源。一个应用缓冲区可在多个 Context 注册，得到不同原生句柄。[T5][T7][T8]
+
+选路后，TENT 使用该 Context 对应的 Jetty 和 Segment；Adapter 在提交前校验它们属于同一 Context。不能把 A 的 Segment 句柄直接交给 B 的 Jetty。
+
+提交前保留 Segment 引用，完成/排空后再释放；清理失败的对象进入保留或隔离状态，避免仍在 DMA 时销毁。
+
+**为何无需复制：** 需要的多资源所有权与生命周期已经存在；TENT 无需同时维护一套仅用于模拟 URMA ABI 的虚拟句柄。
+
+**仍需增强：** 致命设备故障后，重新创建 Context/JFC、重新注册内存、发布新 generation 的完整流程还没有闭环。不能把按需重建 Jetty 当成整个设备已重建。
+
+### 4.3 拓扑选路：会挑路线，但不能把候选当成已证明可达
+
+当前 `orderedLocalDevices()` 根据内存位置、设备 mask、Context 活跃状态和拓扑优先级生成本地候选；远端候选来自目标缓冲区已发布的设备注册描述。
+
+`chooseAndResolveEndpoint()` 枚举本地与远端组合，排除暂停 rail，进行预评分，再按需解析 Endpoint。解析顺序优先覆盖不同本地设备，避免所有候选都集中在同一设备。[T4]
+
+```mermaid
+flowchart LR
+    L["本地 A、B：内存位置和设备 mask"] --> C["构造本地 × 远端候选"]
+    R["远端 X、Y：已发布注册描述"] --> C
+    C --> F["过滤不可用状态与暂停路径"]
+    F --> E["评分、按需 Bootstrap、导入与绑定"]
+    E --> Q["原子预留配额后提交"]
+```
+
+建链通过控制面交换 EID、Jetty ID、UASID 和代际信息。控制面的 RPC 可达，不等于实际 UB 数据路径可达。
+
+**为何无需复制：** 已经有多设备候选和选路执行器，不需要再做一次“bonding EID 展开”。
+
+**仍需增强：** 活跃端口、NUMA 接近或存在元数据，都不证明某对物理 EID 可通信。当前缺少完整的 peer-specific 可达矩阵和双端 `trans_mode / tp_type / priority / ordering` 协商。Adapter 当前创建 RC，导入描述指定 CTP；不能仅改一个枚举就假设支持任意 RTP/CTP 组合。[T3]
+
+### 4.4 带宽聚合：TENT 可以替应用把包裹分给 A、B
+
+假设两条独立路径都可用，各有 100 GB/s 能力。应用直接把所有 WR 发给 A，B 不会自动帮忙；接入 TENT 后，每个 slice 都会经过选路，因此可并行使用 A、B。
+
+当前评分是按以下顺序逐项比较，不是简单轮询，也不是按峰值带宽固定五五分：
+
+```text
+配额是否可用 → 拓扑优先级 → 归一化在途压力
+    → Endpoint 未完成 WR/字节数 → 带宽样本 → 确定性排序
+```
+
+源码：[T4] `betterUbPathScore()`、`chooseAndResolveEndpoint()`；[T11] `QuotaManager`。
+
+**为何无需复制：** 逐 slice 的调度与负载反馈已经承担多设备分流职责；一个大应用 WRITE 拆开后，也可以利用多设备。
+
+**边界：** 拓扑优先级先于负载。A 更近且仍有配额时，B 可能长期不被优先选择。并发不足、内存带宽瓶颈、对端瓶颈、路径共享物理资源都会限制总带宽；不能据此承诺 200 GB/s。
+
+若目标是优先追求总吞吐，可以增加可选的预计完成时间策略，而不是默认改变当前拓扑优先行为。
+
+### 4.5 主备切换：从“应用自己重试”变成“TENT 内部重试”
+
+当前成功、超时、本地设备、远端路径、Endpoint、内存和未知错误分别分类。Worker 对部分错误安排重试；slice 默认最多额外重试 8 次。[T2][T3][T4][T6]
+
+```mermaid
+flowchart TD
+    W["slice 经 A 提交"] --> Result{"收到什么结果？"}
+    Result -->|成功 CR| Done["该 slice 成功"]
+    Result -->|可重试错误 CR| Retry["更新健康状态、退休 Endpoint、检查预算"]
+    Result -->|没有完成且超时| Fence["quiesce：停止并排空旧尝试"]
+    Fence --> Safe{"得到合格的排空证据？"}
+    Safe -->|否| Keep["保留资源，继续清理；不盲目并行重试"]
+    Safe -->|是| Retry
+    Retry --> Budget{"还有预算且允许重试？"}
+    Budget -->|是| Route["重新选路，可能改走 B"]
+    Budget -->|否| Fail["报告最终错误"]
+```
+
+`scanTimeouts()` 对没有完成的旧 WR 先做排空。成功后才回收残留 token、释放配额并推进重试；失败则保留资源，继续尝试。当前单条 WR 已接受时，即使 post 同时返回错误，也按已提交处理，不立即重复提交。[T4]
+
+**为何无需复制：** 应用不必自己保存原生 WR 并重放；TENT 保留逻辑 slice、地址范围和本次资源，必要时构造新的 WR。
+
+**仍需增强：** 这不是明确的主备策略，也不保证每次一定选 B。原始错误分类仍较粗，部分远端权限/不支持操作错误被归为可重试路径错误。排空证明与“远端是否已执行”也是两件事，WRITE 的安全重放契约、永久错误分类及真实 provider 的 fence 语义仍需完善。
+
+### 4.6 健康检查、故障回切：已有冷却重试，没有完整探路闭环
+
+当前 UB 有两种基础恢复：
+
+| 层次 | 当前恢复条件 | 不能推出什么 |
+| --- | --- | --- |
+| 物理 rail | 错误窗口达到阈值后暂停；冷却到期解除暂停 | 不能证明链路已恢复 |
+| 本地 Context | 旧 Endpoint 清理完成、无在途 WR、各 JFC 在故障 epoch 下 poll 成功、冷却到期 | 不能证明到某个远端 EID 可达 |
+
+`RailMonitor::refreshCooldownLocked()` 按时间解除暂停并增加 `recoveries`。这里计数表示重新开放尝试，不是独立探测成功次数。[T12]
+
+JFC 空 poll 也可能正常返回，因此“本地队列能轮询”与“道路能到对端”必须分开。之后再次选择该路径时，失效 Endpoint 可按需重建；没有业务时，未见独立周期数据面探测来确认恢复。[T4][T7][T8]
+
+同级 bonding 的健康检查和故障回切主要围绕 Jetty 组织；不能假定独立 JFS/JFR 也具备同等能力。比较两组方案时，应保持资源模型一致。[U3][U8]
+
+**为何不能说完全无需补齐：** 当前相当于“封路一会儿，再允许试着走”；用户期待的是“派探路车确认通了，再开放业务”。主动探测、Half-Open、设备重建和回切防抖见第 7 节。
+
+### 4.7 软件 RNR 重试：已接入通用重试，缺少专用流控策略
+
+RNR 表示接收端未就绪。以 SEND 为例，接收端未补足接收 WR 时可能触发；不能把普通 READ/WRITE 的所有错误都解释为 RNR。
+
+当前 Jetty 配置会传入 `rnr_retry`，默认字段值为 7。这个编码不能直接写成“重试七次”，应以对应 URMA/provider 定义为准。
+
+如果实际返回 `URMA_CR_RNR_RETRY_CNT_EXC_ERR`，Adapter 会归为 `REMOTE_PATH_ERROR`，Worker 记录路径错误、退休 Endpoint，再通过普通 slice 预算重试。[T3][T4]
+
+**为何无需从零补齐：** 硬件耗尽后软件再提交的入口已经存在，且不依赖开启 bonding 的软件 RNR 开关。
+
+**仍需增强：** 暂时缺接收资源不一定是链路故障；换路也未必解决。当前没有 RNR 独立等待、退避、预算和指标，可能较快消耗重试次数或反复重建。若 provider 要求错误后重建 Jetty，仍须重建，不能一概保留旧实例。未来支持 SEND 时还要设计接收 WR 补充和流控。[U3]
+
+### 4.8 完成和事件聚合：回执汇总已有，通知铃还没完整接上
+
+```mermaid
+flowchart LR
+    JA["设备 A 的发送 JFC"] --> Poll["TENT 多 poller 轮询"]
+    JB["设备 B 的发送 JFC"] --> Poll
+    Poll --> Token["CR.user_ctx → completion token"]
+    Token --> Attempt["Inflight / attempt / slice"]
+    Attempt --> Task["整任务状态与传输字节数"]
+    Task --> API["应用：getTransferStatus / progressBatch"]
+```
+
+TENT 将内部 token 写入原生 WR 的 `user_ctx`，CR 返回后查找 Inflight。Slice 检查 attempt 和路径代际，Task 用已结算 slice ID 防止重复计数。[T3][T4][T6]
+
+**为何无需复制：** 应用看到的是逻辑任务，不直接消费物理 CR；无需把物理 Jetty ID 再改成一个虚拟 Jetty ID，也无需另建可供应用 `urma_poll_jfc()` 的虚拟 JFC。
+
+JFC 存放具体回执；JFCE 用于事件唤醒。当前 Adapter 有创建 JFCE 和返回 FD 的基础代码，但 `enable_completion_events` 默认为 false，Workers 没有完整的 wait/rearm/ack 事件处理流程，主要轮询 JFC，空闲时短暂休眠。
+
+**仍需增强：** 若要求低空闲 CPU 的事件模式，需要补齐多 JFCE 等待与丢唤醒竞态处理。TENT 的 `sendNotification()/receiveNotification()` 是业务通知，不等于 JFCE 完成事件；不能把两者混用。
+
+### 4.9 MSN 去重：当前普通读写不适用，未来消息交付才需要
+
+bonding 的相关实现会为支持的 SEND 类操作及 WRITE_IMM 等编码消息序号，接收侧用滑动窗口识别重复，并处理被重复消息消耗的接收资源。普通 READ/WRITE、CAS、FADD 不使用这套 MSN 编码。[U4]
+
+当前 TENT UB 数据面只生成普通 `URMA_OPC_READ`、`URMA_OPC_WRITE`；`enable_notifications=true` 会返回未实现。没有 SEND 接收交付过程，因此没有必要为了当前范围照搬 MSN。[T1][T3]
+
+| 相似名称 | 当前是否有 | 实际保护对象 |
+| --- | --- | --- |
+| 完成去重 | 有 | 发送端状态不重复结算 |
+| 消息交付去重 | 当前无对应 SEND 路径 | 同一消息不重复向接收应用交付 |
+| 远端副作用去重 | 没有通用机制 | 防止重复 WRITE、原子或业务执行 |
+
+**为何当前无需补齐：** 不属于本次普通单边读写语义，增加一个 MSN 计数器不能阻止远端重复写。
+
+**条件性补齐：** 未来加入可重试 SEND/通知时，需要跨 attempt 不变的消息 ID、发送方会话代次、去重窗口和重复确认；保证“只交付一次”仍不等于业务恰好执行一次。
+
+### 4.10 Segment 导入缓存：TENT 复用的是已导入句柄
+
+`UbBufferMetadata` 保存同一缓冲区在不同远端设备上的描述。`importRemote()` 校验范围、权限和元数据，然后在选中的本地 Context 中导入相应远端 Segment。[T5]
+
+缓存键为：
+
+```text
+local_topology_id + remote_segment_id + remote_topology_id
+    + buffer_base + generation
+```
+
+```mermaid
+flowchart TD
+    Req["请求选定本地 A、远端 X、某注册版本"] --> Check["校验范围、权限和设备描述"]
+    Check --> Cache{"句柄缓存命中？"}
+    Cache -->|是| Reuse["复用已有 RemoteSegmentPtr"]
+    Cache -->|否| Import["在 Context_A 调用物理 Segment 导入"]
+    Import --> Save["保存句柄"]
+    Save --> Use["提交本次 READ/WRITE"]
+    Reuse --> Use
+```
+
+与前面描述的 bonding 信息缓存不同，TENT 命中时不再调用 `adapter_->importRemoteSegment()`。同级 UMDK 的 `bondp_import_seg()` 即使命中物理展开信息缓存，后面仍会调用 `bondp_import_pseg()`。[U5]
+
+**为何无需复制：** 多设备注册描述与按路径句柄复用均已有；缓存的不是远端数据，READ 仍然经过设备读取。
+
+**仍需增强：** 新 generation 只有在元数据刷新后才能被看到；旧版本会尝试清理，但在途引用或释放失败会延后。当前缓存未见容量/TTL 策略，大量短生命周期远端缓冲区需要考虑容量与撤销通知。设备重建也必须使关联注册和导入失效。
+
+## 5. 当前部署时要先确认的配置与契约
+
+### 5.1 显式选择物理设备，避免实际仍选了 bonding
+
+当 `device_filter` 为空且发现 bonding 设备时，TENT 默认优先选择 bonding。验证物理设备方案应显式过滤；原生设备名可能选中该设备多个 EID，需要精确选择时使用发现日志中的完整拓扑名。[T1][T2][T9]
+
+下面是配置结构示例，两个 `PHYSICAL_*` 字符串是占位符，必须替换成实际发现的物理设备/拓扑名：
 
 ```json
 {
-  "policy": [
-    {
-      "name": "foreground-kv",
-      "segment_type": "memory",
-      "intent_type": "foreground_get",
-      "transports": ["rdma", "ub", "tcp"]
-    },
-    {
-      "name": "memory-default",
-      "segment_type": "memory",
-      "transports": ["rdma", "tcp"]
+  "transports": {
+    "ub": {
+      "enable": true,
+      "device_filter": ["PHYSICAL_A_TOPOLOGY_NAME", "PHYSICAL_B_TOPOLOGY_NAME"],
+      "slice_size": 65536,
+      "max_retries": 8,
+      "slice_timeout_ms": 5000,
+      "endpoint_cooldown_ms": 1000
     }
-  ]
+  }
 }
 ```
 
-前台 KV 请求先匹配第一条，其他内存请求匹配第二条。排列表示偏好及可供恢复使用的候选顺序，不表示一次请求同时向三个 transport 喷洒切片。
+还需保证构建包含真实 URMA 支持、拓扑列出了相应设备、任务 device mask 允许使用、两端注册与通信参数匹配。仅设置过滤器不等于完成可达性验证，也不能保证两个 EID 对应独立故障域。
 
-“动态”主要体现在按每个请求的当前上下文做选择、在失败后重新解析候选；当前跨 transport 恢复没有根据实时延迟自动判断“健康但太慢就切换”的机制。
+### 5.2 当前普通读写应明确的使用约定
 
-## 4. 能力二：细粒度切片与多 rail 调度
+- 等整个任务完成，不把 `submit` 成功当成数据已就绪。
+- 保持缓冲区有效，WRITE 源数据在在途与重试期间不变化；按约定管理 READ 的远端数据稳定性。
+- 对目的范围建立写入所有权，避免超时重放覆盖另一笔新数据。
+- 使用任务完成后的同步/版本发布，让接收方只消费完整对象；跨设备写一个标志不天然就是全局屏障。
+- 永久故障允许安全失败；资源无法排空时，不以强制释放换取表面上的快速返回。
+- 不把普通读写推广为原子操作、GPU 内存或 exactly-once 业务执行的保证。
 
-### 4.1 为什么大请求需要切片
+这些约定不应仅要求物理设备方案遵守；与 bonding 对照时，两组应采用相同业务契约和实际传输模式。
 
-若把一个大请求整体固定到一张网卡，其完成速度就被该网卡限制。拆成多个 slice 后，可以：
+## 6. 源码索引与现有验证入口
 
-1. 同时利用多张网卡。
-2. 随每张网卡的负载调整后续分配。
-3. 在单条 rail 出错时重试对应 slice。
-4. 用细粒度 completion 更新带宽估计。
+以下 T 编号链接均相对本文所在目录，函数名用于在代码变动后继续定位。
 
-但每个 slice 都有 WR、CQE、排队和完成处理开销，所以切片越多并不总是越好。
+| 编号 | 源码 | 重点入口 |
+| --- | --- | --- |
+| T1 | [ub_transport.cpp](../mooncake-transfer-engine/tent/src/transport/ub/ub_transport.cpp) | 初始化、slice 收紧、`submitTransferTasks`、`getTransferStatus`、Bootstrap |
+| T2 | [params.h](../mooncake-transfer-engine/tent/include/tent/transport/ub/params.h) | 实际支持的 UB 配置与默认值 |
+| T3 | [urma_adapter.cpp](../mooncake-transfer-engine/tent/src/transport/ub/urma_adapter.cpp)、[urma_adapter.h](../mooncake-transfer-engine/tent/include/tent/transport/ub/urma_adapter.h) | 原生资源、RC/CTP、RNR、WR、CR、JFCE、排空 |
+| T4 | [workers.cpp](../mooncake-transfer-engine/tent/src/transport/ub/workers.cpp)、[workers.h](../mooncake-transfer-engine/tent/include/tent/transport/ub/workers.h) | 选路评分、post、poll、重试与超时 |
+| T5 | [buffers.cpp](../mooncake-transfer-engine/tent/src/transport/ub/buffers.cpp)、[buffers.h](../mooncake-transfer-engine/tent/include/tent/transport/ub/buffers.h) | 多 Context 注册、导入缓存、generation、延迟释放 |
+| T6 | [slice.h](../mooncake-transfer-engine/tent/include/tent/transport/ub/slice.h) | `resolveAttempt`、attempt 校验、任务完成汇总 |
+| T7 | [context.cpp](../mooncake-transfer-engine/tent/src/transport/ub/context.cpp)、[jfc.cpp](../mooncake-transfer-engine/tent/src/transport/ub/jfc.cpp) | Context/JFC 生命周期、`recordPollSuccess` |
+| T8 | [endpoint.cpp](../mooncake-transfer-engine/tent/src/transport/ub/endpoint.cpp)、[endpoint_store.cpp](../mooncake-transfer-engine/tent/src/transport/ub/endpoint_store.cpp) | 创建、绑定、退休、quiesce、隔离 |
+| T9 | [device_selection.h](../mooncake-transfer-engine/tent/include/tent/transport/ub/device_selection.h)、[topology.cpp](../mooncake-transfer-engine/tent/src/runtime/topology.cpp)、[control_plane.h](../mooncake-transfer-engine/tent/include/tent/runtime/control_plane.h) | 设备优先、拓扑身份与 UB 握手结构 |
+| T10 | [transfer_engine_impl.cpp](../mooncake-transfer-engine/tent/src/runtime/transfer_engine_impl.cpp)、[transport_selector.cpp](../mooncake-transfer-engine/tent/src/runtime/transport_selector.cpp)、[proxy_manager.cpp](../mooncake-transfer-engine/tent/src/runtime/proxy_manager.cpp) | 四项核心能力在 runtime 的编排 |
+| T11 | [quota.cpp](../mooncake-transfer-engine/tent/src/transport/ub/quota.cpp) | 路径/设备配额与幂等释放 |
+| T12 | [rail_monitor.cpp](../mooncake-transfer-engine/tent/src/transport/ub/rail_monitor.cpp) | 被动健康反馈、冷却到期解除暂停 |
 
-### 4.2 RDMA 切片计划：限制数量并合并小尾巴
+UMDK 是独立的同级仓库，以下路径不属于 Supercache，需在开头记录的 UMDK 快照中查找：
 
-`RdmaTransport::submitTransferTasks()` 调用 `planRdmaSlices()`。
+| 编号 | UMDK 内路径 | 重点 |
+| --- | --- | --- |
+| U1 | `src/urma/lib/urma/bond/bondp_datapath_schedule.c` | Balance 等模式的路径分配，不应笼统描述成固定轮询 |
+| U2 | `src/urma/lib/urma/bond/bondp_datapath.c` | WR 保留、重试、完成转换与接收去重 |
+| U3 | `src/urma/lib/urma/bond/bondp_dp_health.c`、`bondp_dp_failback.c`、`bondp_dp_rnr_retry.c`、`bondp_env.c` | 主动探测、回切、软件 RNR 与默认开关 |
+| U4 | `src/urma/lib/urma/bond/bondp_datapath_convert.c`、`bondp_provider_ops.c` | `encode_jfs_wr_msn` 与默认关闭的 MSN |
+| U5 | `src/urma/lib/urma/bond/bondp_cp_seg.c` | `bondp_import_seg`、信息缓存与物理导入 |
+| U8 | `doc/ch/urma/URMA User Guide.ch.md`、`doc/ch/urma/URMA API Guide.ch.md` | 聚合设备能力、传输类型及 API 约束 |
 
-当前代码中，最大切片数一般为 64；本地内存为 CUDA 或操作为 WRITE 时为 32。基础 block 默认为 64 KiB，但可由 RDMA 配置改变。
+更完整的可靠性约束和硬件验收设计见 [TENT 直接使用物理 UB 设备的可靠性分析与增强设计](../docs/analyze/tent-physical-ub-reliability-design.md)。本文是便于学习的职责对照，不替代该设计中的安全门槛。
 
-切片算法分为四步：
+现有测试可帮助核对实现，但本次文档更新没有执行这些 C++ 测试或硬件测试：
 
-1. 用基础 block 计算初始片数，并限制到 `max_slices`。
-2. 按片数重新计算每片大小，再向上对齐到基础 block。
-3. 用对齐后的 block 重新计算真实片数，避免空切片。
-4. 若尾片小于 block 的 25%，合并到前一片。
+| 测试文件 | 已有案例方向 |
+| --- | --- |
+| [ub_core_test.cpp](../mooncake-transfer-engine/tent/tests/ub_core_test.cpp) | 重复/迟到完成、幂等配额、选路评分、冷却恢复、设备过滤 |
+| [ub_teardown_test.cpp](../mooncake-transfer-engine/tent/tests/ub_teardown_test.cpp) | 旧 generation 清理、失败资源保留、Context 恢复屏障 |
+| [ub_native_data_path_test.cpp](../mooncake-transfer-engine/tent/tests/ub_native_data_path_test.cpp) | 原生接口适配、缺失完成后的 fence、Endpoint 代际与自读写路径 |
 
-例如，假设基础 block 特意设置为 256 KiB，请求为 1025 KiB：
+Fake provider 能证明状态转换和资源计数，不能替代真实 UDMA 的 DMA 停止、远端可见性、链路失效或吞吐验证。
 
-- 初算为 5 片。
-- 最后一片只有 1 KiB。
-- 合并后为 4 片：256、256、256、257 KiB。
-- 总长度保持不变，最后一片可以比名义 block 大。
+## 7. 最后需要补齐什么，以及怎样实现
 
-这也解释了为何配额必须按实际 slice 长度扣账，不能对每片都固定扣一个 block。
+下面均为建议方案，尚未实现。P0 表示将物理设备方案作为可靠生产替代前的安全/进展门槛；P1 表示目标高可用闭环所需；P2 表示按性能或规模需要增强。未来消息能力单独标为条件项。
 
-零长度请求保留一片，用于正常完成任务计数；如果直接生成零片，任务可能永远无法走到完成态。
+### 7.1 优先级清单
 
-源码定位：`tent/include/tent/transport/rdma/slice.h:69`；`tent/src/transport/rdma/rdma_transport.cpp:522`、`:553`。
+| 优先级 | 待补齐内容 | 关联上面的功能 | 建议实现位置 |
+| --- | --- | --- | --- |
+| P0 | 物理身份、EID 对可达性、双端 profile 与严格绑定校验 | 身份、拓扑、主备 | Topology、Bootstrap、Adapter、路径管理 |
+| P0 | 明确重放语义、永久错误分类与真实 fence 契约 | 主备、RNR、完整性 | Adapter、Workers、Slice、上层发布协议 |
+| P0 | Endpoint 候选租约与小缓存下的有界进展 | 资源、选路、恢复 | EndpointStore、Workers |
+| P1 | 主动探测、Half-Open、回切策略与设备重建 | 健康检查、故障回切 | 路径管理、Context、BufferManager |
+| P1 | 统一请求期限，覆盖排队、配额、建链和重试 | 主备、RNR、资源等待 | Workers、Slice、runtime |
+| P1，出现 RNR 或增加 SEND 时 | RNR 专用分类、退避、预算与接收流控 | 软件 RNR | Adapter、Workers、消息接收层 |
+| P2，按吞吐目标启用 | 可选的总吞吐优先调度 | 带宽聚合 | Workers、Quota |
+| P2，按 CPU 目标启用 | JFCE 驱动或混合轮询/事件等待 | 完成和事件聚合 | Adapter、Jfc、Workers |
+| P2，按规模启用 | 导入缓存容量、撤销通知与淘汰 | Segment 导入缓存 | BufferManager、元数据层 |
+| 条件项：未来 SEND/通知 | 消息 ID、会话代次、接收窗口与重复确认 | MSN 等价能力 | 新消息协议；无需复制 bonding 编码格式 |
 
-### 4.3 不是每个请求都预先做批量分流
+### 7.2 方案 A：先把“哪条路能走”建模清楚
 
-当片数达到 `max_slice_count / 2`，RDMA 尝试调用 `Workers::allocateDevices()` 一次性为请求的多个 slice 分配本地设备。
-
-如果请求覆盖多个不同位置的内存 region，整体 location 不能代表每个 slice，`allocateDevices()` 会保留逐 slice 选择路径。批量分配不能抹掉 NUMA 或 GPU 位置差异。
-
-批量分配前还会结合远端 rail 可达性收缩本地 device mask。并非只看本地设备空闲程度。
-
-源码定位：`tent/src/transport/rdma/rdma_transport.cpp:559`；`tent/src/transport/rdma/workers.cpp:1556`。
-
-### 4.4 RDMA 智能调度的评分
-
-`DeviceSelector::buildCandidates()` 先筛除：
-
-- 不可用设备。
-- 不符合 `device_mask` 的设备。
-- 不满足 NUMA 限制的设备。
-- 不满足优先级资源规则的设备。
-- 已学习到无法对相应 GPU 执行 GPUDirect DMA 的本地 NIC。
-
-然后计算近似评分：
-
-```text
-predicted_time = (inflight_bytes + slice_bytes) / ewma_bandwidth
-score = predicted_time × numa_tier_weight + small_jitter
-```
-
-默认 NUMA 权重为 1、5、10；分数越小越优先。默认并非“绝不跨 NUMA”，而是给远端 NUMA 更高成本；`strict_local_numa` 才是进一步的严格限制。
-
-举例，两个同 NUMA NIC 的估计带宽均为 10 GB/s：
-
-- A 已有 20 MB 在途，新增 1 MB：约 2.1 ms。
-- B 已有 1 MB 在途，新增 1 MB：约 0.2 ms。
-
-B 更适合承担新切片。若 B 属于惩罚较大的 NUMA 层，其优势需要重新乘权重比较。
-
-这些数值只用于解释公式，不是硬件实测。
-
-源码定位：`tent/src/transport/rdma/quota.cpp:223`；`tent/src/transport/rdma/workers.cpp:94`。
-
-### 4.5 单路径、加权分配与探测
-
-`DeviceSelector::allocate()` 在智能模式下：
-
-- 一片请求：选择评分最好的设备。
-- 多片请求：按 `1 / (score + epsilon)` 的权重分配切片。
-- 整数分配产生的剩余片数分配给最佳设备。
-- 该分配分支每个线程每第 100 次多片调用采用轮询探测，使较少使用的设备仍能获得测量样本。
-
-因此，“按带宽比例分片”只是近似直觉；真实权重还包含在途负载、NUMA 和其他评分因素。
-
-关闭 `transports/rdma/enable_smart_scheduling` 时，采用基线算法：只在最高优先级的非空设备层中轮询。当前开关默认值为 `true`。
-
-源码定位：`tent/src/transport/rdma/quota.cpp:100`、`:307`。
-
-### 4.6 completion 怎样反馈到下一次选择
-
-智能模式在分配时增加设备在途字节；成功完成、失败、取消或重新分配时释放对应计数。
-
-`DeviceSelector::release()` 只有在存在正的 latency 样本时才学习带宽。失败或转移设备产生的无有效时延释放不更新带宽。
-
-更新规则：
+新增物理路径管理组件，复用现有 Workers/EndpointStore，避免在 Adapter 内再实现一套调度：
 
 ```text
-observed_bandwidth = completed_bytes / latency_seconds
-new_ewma = alpha × old_ewma + (1 - alpha) × observed_bandwidth
+PathKey = 本地稳定设备/EID身份 + 对端进程代次/设备/EID身份 + profile
+PathSnapshot = PathKey + 拓扑版本 + health epoch + 可用状态
+profile = RC/RM + RTP/CTP + ordering + priority/SL 等必要参数
 ```
 
-随后按理论带宽的倍率范围夹紧，避免异常样本无限放大或压低估计。
+1. 控制面发布部署可达关系和故障域；未知可达性只允许受控建链/探测，不能直接等同健康备路。
+2. 双端协商兼容 profile；当前固定 RC/CTP 的合法性由具体 provider 验证，不能仅靠端口活跃判断。
+3. 提交前复核身份、代次和 profile，防止对端重启或本地资源重建后继续用旧句柄。
+4. 处理 `URMA_EEXIST` 时校验实际绑定目标；相同目标才幂等成功，不同目标应拒绝并清理。
+5. 路径必须区分共享故障域，两个同设备 EID 不能自动算作独立备路。
 
-这里 `alpha` 作用于旧值。默认 `bandwidth_learning_rate=0.01`，意味着新样本权重为 99%，不能解释成“只学习新样本的 1%”。
+### 7.3 方案 B：安全重试与统一期限
 
-实现还维护另一套 `transmit estimate`，供 deadline 预测使用。它以设备有已提交工作时的忙碌时间衡量吞吐，避免把队列等待再次折算进链路速率。用于选 NIC 的 EWMA 与用于预计传输时长的速率不是同一个统计序列。
-
-源码定位：`tent/src/transport/rdma/quota.cpp:415`、`:538`；`tent/src/transport/rdma/workers.cpp` 的完成处理。
-
-### 4.7 UB 的多 rail 选择是另一套算法
-
-UB 复用“切片、配额、健康反馈”的思想，但没有直接调用 RDMA 的 `DeviceSelector`。
-
-`UbWorkers::chooseAndResolveEndpoint()` 分两阶段：
-
-1. 先对本地设备 × 远端设备组合进行 rail 级评分。
-2. 按评分惰性解析少量 endpoint，再从 Ready 候选中原子获取 quota。
-
-UB 的 `UbPathSelectionScore` 按字典序比较配额可用性、拓扑层级、规范化负载、endpoint 负载、带宽样本和重试顺序等。它不是 RDMA 的单一预计完成时间公式。
-
-`statsIfPresent()` 不会为纯探测组合插入 rail 状态。候选解析顺序优先覆盖各本地设备，Ready 候选数量目标为 `max(2, local_device_count)`。解析失败可能增加尝试次数，不能将该数值说成 bootstrap RPC 的绝对上限。
-
-`QuotaReservation` 在 segment 查找、导入及 post 前就取得，后续失败需要归还。物理 rail 的 quota 不随 endpoint generation 更换而重新获得一份额度。
-
-源码定位：`tent/src/transport/ub/workers.cpp:585`、`:703`、`:772`；`tent/include/tent/transport/ub/workers.h` 中的评分结构。
-
-## 5. 能力三：通过中转内存完成 staged transfer
-
-### 5.1 首先识别哪些 hop 无法直接执行
-
-`findStagingPolicy()` 根据本地和远端内存位置、后端 capabilities 以及已经安装的本地拷贝/网络后端，构造 staging 参数。
-
-典型例子是 CUDA GPU 跨节点传输，但 RDMA 不具备相应 GPU 直访能力。支持的路径可以变为：
+不要只返回一个 `retryable=true/false`。建议将决策拆成：
 
 ```text
-本地 GPU → 本地 host DRAM → 网络 → 远端 host DRAM → 远端 GPU
+RetryDecision：
+  原始 CR / opcode / metadata generation
+  远端执行结果：NotExecuted / Completed / Unknown
+  旧尝试是否已排空：DMA 安全状态
+  是否允许业务重放、是否需刷新元数据、是否需重建 Endpoint
+  剩余重试预算、退避时间、整请求截止时间
 ```
 
-只有一端需要中转时，会省略另一端的本地拷贝。
+具体步骤：
 
-代码也包含 MNNVL、TPU、XPU、MLU 的专门规则。不同设备分支的网络后端允许集合并不完全相同：例如 XPU/MLU host-staging 选择分支当前列举 RDMA、FABRIC、TCP、HP_TCP，不能因为 TPU 支持 UB host hop 就推断所有设备 staging 都能使用 UB。
+1. 永久权限、范围和不支持操作错误直接失败；只有有依据的注册过期才刷新元数据。
+2. 超时保留 `Unknown` 语义。合格 fence 证明不再 DMA，不自动改成“远端确定未执行”。
+3. READ 重试需满足远端数据稳定性；WRITE 重试需满足稳定源数据与目的范围所有权。无法满足时，使用新版本缓冲区写完再发布，或报告未知结果。
+4. 保留现有排空与隔离机制，并在真实 provider 上验证错误 CR、flush-done、RESET 等边界。
+5. 将请求期限带到排队、配额等待、Endpoint 解析、导入与 RNR 退避。到期先停止新尝试，再排空；不能为了到期返回而提前释放仍在 DMA 的内存。
+6. runtime 跨 transport 恢复也要继承重放决策与总期限。当前主要针对 `FAILED` 的恢复，不能假定任意 `TIMEOUT` 都自动切后端。
 
-这是根据已编码规则分解请求，并非对任意内存、任意设备、任意中继服务器运行通用最短路径算法。
+为解决小 Endpoint 缓存下候选可能被后续候选构造淘汰的问题，建议让解析结果返回短期候选租约：选路结束前保护实例；提交时原子转成 outstanding；失败释放租约。候选数要感知容量，不能让 `max_endpoints=1` 反复退役刚选中的对象。
 
-源码定位：`tent/src/runtime/transfer_engine_impl.cpp:1541`、`:1942`。
-
-### 5.2 staging 参数传给谁
-
-staging 参数包含三个位置：
-
-```text
-params[0] = 远端控制服务地址
-params[1] = 本地 stage location；空字符串表示本端不需要中转
-params[2] = 远端 stage location；空字符串表示对端不需要中转
-```
-
-`prepareSubmit()` 保存这些参数。`commitPreparedSubmit()` 遇到 staged owner 时，把任务交给 `ProxyManager::submit()`，而不是把原始设备地址直接交给只能处理 host 内存的网络后端。
-
-`TaskInfo::staging` 用于让状态查询进入代理任务状态。staging 是编排步骤，本身不是新 transport；真正的各个 hop 仍由具体后端执行。
-
-源码定位：`tent/src/runtime/transfer_engine_impl.cpp:2174`、`:2278`。
-
-### 5.3 三类子传输怎样构造
-
-`ProxyManager` 把 chunk 拆成以下子请求：
-
-| 子步骤 | 地址与目标 | 执行位置 |
-|---|---|---|
-| Local stage | 本地原始地址与本地 stage buffer，目标是 `LOCAL_SEGMENT_ID` | 本进程 |
-| Cross stage | 本地 stage buffer 与远端 stage buffer，目标是远端 Segment | 网络传输 |
-| Remote stage | 远端 stage buffer 与远端原始地址，目标是远端进程的本地 Segment | 通过控制 RPC 委托远端执行 |
-
-`submitLocalStage()` 和 `submitCrossStage()` 会分配内部 Batch，再调用 `submitStagingTransfer()`。远端 stage 使用 `ControlClient::delegate()` 或对应异步接口。
-
-因此，数据走 RDMA/UB 等网络后端，并不意味着控制面完全不用 IP/RPC。
-
-源码定位：`tent/src/runtime/proxy_manager.cpp:225`、`:247`、`:276`、`:289`。
-
-### 5.4 WRITE 与 READ 的阶段顺序
-
-WRITE 的生产者是本地原始内存，顺序为：
-
-```text
-Local stage：本地设备 → 本地 stage
-Cross stage：本地 stage → 远端 stage
-Remote stage：远端 stage → 远端设备
-```
-
-READ 的生产者在远端，所以顺序反过来：
-
-```text
-Remote stage：远端设备 → 远端 stage
-Cross stage：远端 stage → 本地 stage
-Local stage：本地 stage → 本地设备
-```
-
-这并不要求每次重写 opcode：内部 Request 对 READ/WRITE 的地址解释使同一组原始 opcode 可以表达这些 hop。
-
-`transferSync()` 清楚展示这个顺序，适合用于理解语义；当前 `runner()` 实际调用 `transferEventLoop()`，不能把 `transferSync()` 当成唯一运行路径。
-
-源码定位：`tent/src/runtime/proxy_manager.cpp:410`、`:814`。
-
-### 5.5 chunk 流水线怎样工作
-
-ProxyManager 默认 chunk 大小为 4 MiB，每个 location 的 arena 含 64 个 chunk。arena 在首次需要该 location 时分配并注册，默认总容量为 256 MiB。
-
-单个 event-loop staging 任务使用的循环缓冲数量上限为 `min(chunk_count, 16)`。这不是整台机器的全局并发上限。
-
-`transferEventLoop()` 把大请求按 chunk 切开，每个 chunk 维护状态：
-
-```text
-PRE → CROSS → POST → FINISH
-       ↕         ↕
-    INFLIGHT / INFLIGHT_REMOTE
-任意阶段出错 → FAILED
-```
-
-实际过程：
-
-1. 给每个 chunk 指定一对可复用 stage buffer。
-2. 根据 READ/WRITE 决定 PRE 是本地拷贝还是远端拷贝。
-3. 子 Batch 或异步 RPC 未完成时，将 chunk 留在 in-flight 状态。
-4. 某个 chunk 前进时，其他 chunk 可以执行自己的阶段。
-5. 同一 buffer 通过本地/远端占用集合保护，不能被两个尚未完成的 chunk 覆盖。
-6. 完成最后所需阶段后才将 chunk 视为完成。
-7. 整个逻辑任务在所有 chunk 成功后完成。
-
-这样可以让某些 chunk 执行设备拷贝时，另一些 chunk 正在经过网络。流水线隐藏部分阶段延迟，但其吞吐仍受最慢阶段、buffer 数量和设备能力限制。
-
-源码定位：`tent/include/tent/runtime/proxy_manager.h:54`；`tent/src/runtime/proxy_manager.cpp:467`、`:876`。
-
-### 5.6 中转缓冲为什么不能失败后立即释放
-
-网络请求或远端 delegate 可能已接收工作，但本端尚不知道它是否结束。此时立即把 stage buffer 归还会允许下一请求覆盖它，甚至释放仍被 DMA 访问的内存。
-
-当前代码在无法 drain 时保存：
-
-- 尚未排空的内部 Batch。
-- 本地和远端 stage buffer 的占用。
-- 尚未确认完成的 `RemoteStageOperation`。
-
-这些资源进入 deferred cleanup；后续继续推进完成状态，安全时才 unpin。ProxyManager 退出时还有向引擎移交延迟清理所有权的逻辑。
-
-这部分实现说明“自动中转”不仅是多调用一次 memcpy，还必须维护跨线程、跨 RPC 和设备 DMA 的生命周期。
-
-源码定位：`tent/src/runtime/proxy_manager.cpp` 中的 `flushPendingCleanups()`、`runner()`、`deconstruct()`；`tent/src/runtime/remote_stage_operation.cpp`。
-
-## 6. 能力四：在运行时处理故障与恢复
-
-### 6.1 要分清三种不同问题
-
-| 问题 | 处理层 | 主要机制 |
-|---|---|---|
-| 某个 RDMA/UB slice 或 rail 失败 | transport 内部 | retry、健康状态、换 rail、endpoint 恢复 |
-| 整个 transport 的逻辑任务失败 | TransferEngineImpl | 在候选与预算内尝试其他 transport |
-| 后端仍可用但负载高、变慢 | 调度/可选 deadline 预测 | 新 slice 分配调整、排队或降级；不会仅凭慢就自动跨 transport 重发 |
-
-每一层的 retry count 含义不同。RDMA slice 重试计数与 runtime 的 `max_failover_attempts` 不能相加当作同一个全局次数。
-
-### 6.2 RDMA rail 熔断与恢复
-
-`RailMonitor` 记录本地 NIC 与远端 NIC 组成的 rail 状态。
-
-默认错误窗口为 10 秒，阈值为 3 次，初始 cooldown 为 30 秒，Open 期间的探测间隔为 1 秒。配置可以改变这些值。
-
-主要状态：
+### 7.4 方案 C：从“冷却放行”升级为“探测确认后回切”
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Closed
-    Closed --> Open: 错误达到阈值
-    Open --> Closed: 受控探测成功
-    Open --> HalfOpen: 冷却到期，放行一次试传
-    HalfOpen --> Closed: 试传成功
-    HalfOpen --> Open: 试传失败，增加退避
+    [*] --> Healthy
+    Healthy --> Down: 业务错误或设备事件
+    Down --> HalfOpen: 退避到期，仅允许受控探测
+    HalfOpen --> Down: 探测失败，增加退避
+    HalfOpen --> Recovering: 当前 epoch 的端到端探测成功
+    Recovering --> Healthy: 必要资源重建完成，小流量验证通过
+    Recovering --> Down: 重建或验证失败
 ```
 
-- Closed：正常放行。
-- Open：普通流量避开该 rail，允许受控探测。
-- Half-Open：只允许一次试传，其余请求等待或选择其他路径。
-- `markRecovered()` 清除失败与退避状态。
-- Half-Open 失败会加倍 cooldown，并受上限约束。
-- 冷却时间到期本身不证明链路健康，必须经过一次真实试传。
+这是建议新增的 UB 状态机，不是当前 `RailMonitor` 的已有状态机。
 
-`isAvailable()` 是观察接口，不能承担试传入场控制；`admit()` 才负责原子地授予 probe/trial。取消或提交前失败时需要 `cancelProbe()` 归还名额，防止 rail 永久被一个没有真正发送的探测占住。
+实现要点：
 
-源码定位：`tent/src/transport/rdma/rail_monitor.cpp:137`、`:196`、`:278`；`tent/src/transport/rdma/workers.cpp` 的路径生成与完成处理。
+- 为指定 EID 对准备独立的小型探测资源。可选用读取远端只读探测区并检查期望值，具体需验证 provider 语义；不能写业务内存探路。
+- 探测绑定 peer incarnation、profile、health epoch，旧探测结果不能恢复新故障实例。
+- 单个路径限制并发探测数，失败指数退避并加抖动；没有业务时也能执行，但全局探测开销有上限。
+- 区分完成事件 JFCE 与设备异步故障事件；后者用于尽早发现设备/端口异常，不能靠 JFCE 代替。
+- Jetty 级故障按需重建 Endpoint；设备级故障由恢复协调器排空旧资源，重开 Context/JFC、重新注册内存、使旧导入失效，再原子发布新代际元数据。
+- 主备策略配置主路径和 hold-down，避免刚恢复又反复切换；均衡策略让恢复路径逐步增加流量，不强制所有请求切回 A。
+- 原有 `recoveries` 与新探测成功、设备重建成功指标分开，避免把冷却到期误报为修复成功。
 
-### 6.3 UB 超时恢复必须先证明旧 DMA 已终止
+### 7.5 方案 D：按场景补 RNR、事件、调度与缓存
 
-UB 超时没有收到 completion 时，不能直接释放旧资源并重试，否则旧 WR 可能稍后仍然写内存。
+**RNR：** 保留原始错误码，新增独立类别和延时队列，配置重试间隔、退避与预算。暂时缺接收资源不直接惩罚整条物理路径；是否重建 Jetty 仍遵守 provider 错误状态要求。未来 SEND 必须持续补充接收 WR，并采用接收额度等流控。
 
-当前 `UbWorkers::scanTimeouts()` 先执行 endpoint quiesce/fence。成功 fence 后：
+**完成事件：** 增加经过验证的事件等待模式，统一等待各 JFCE FD 与软件停止/超时唤醒源。按 URMA 约定实现 poll、通知使能、复查、wait、消费/确认事件的闭环；队列非空时继续排空，避免丢唤醒。保留高负载轮询模式，不用事件模式替代完成状态检查。
 
-1. 确认旧 WR 已不会继续 DMA。
-2. 将 provider 没有返回 completion 的残留 token 从 `inflight_` 移除。
-3. 释放 endpoint outstanding 与物理 rail quota。
-4. 再让 slice 进入重试或终态。
+**带宽：** 在保持当前拓扑优先默认策略的前提下，增加可选评分，例如以 `(在途字节 + 本片字节) / 估计带宽` 加拓扑成本估计完成时间；带宽估计要处理冷启动、并发与过期样本，不能把一次 WR 的字节/延迟直接当成稳定链路峰值。
 
-`releaseInflight()` 使用 `resources_released.compare_exchange_strong()` 防止 timeout 扫描与迟到 completion 双重释放。
+**Segment 缓存：** 增加容量和空闲淘汰，按 peer 退出、buffer 撤销、generation/device epoch 变化失效。只能淘汰无在途使用的对象；释放失败进入有上限、可观测的延迟清理，不能丢句柄。
 
-设备级失败还有更强约束：retire 该本地设备的所有 endpoint，未排空的 endpoint 进入 quarantine；必须完成旧资源清理屏障，并满足 JFC 健康恢复条件后，context 才能重新服务。
+### 7.6 方案 E：未来消息去重及验收顺序
 
-源码定位：`tent/src/transport/ub/workers.cpp:1035`、`:1107`；`tent/src/transport/ub/endpoint_store.cpp` 的 `retireLocalDevice()`。
+若增加 SEND/通知，使用跨重试不变的逻辑消息 ID，加发送方会话代次限定作用域；接收端维护有界去重窗口，对重复消息返回确认但不重复交付，正确补回接收资源。窗口还要处理乱序、回绕、进程重启和超出保留范围的迟到消息。
 
-### 6.4 跨 transport 的恢复预算怎样保存
+若要求跨接收进程重启也只交付一次，去重状态必须持久化或由上层事务协议承接；单机内存滑动窗口不具备这一保证。原子或业务副作用同样不能靠完成层 MSN 解决。
 
-`prepareSubmit()` 从 runtime 配置快照复制：
+建议依次验收：
 
-- 配置 generation。
-- `max_failover_attempts`，默认 3。
-- `enable_auto_failover_on_poll`，默认 true。
+| 阶段 | 关键案例 | 通过标准 |
+| --- | --- | --- |
+| 确定性资源测试 | 重复/迟到 CR、部分 post、fence 失败、取消、缓存释放失败 | 不重复终结/释放，不提前放开内存使用权 |
+| 路径与进展测试 | 跨 plane 错配、同设备多 EID、对端重启、小 Endpoint 缓存、配额满 | 严格过滤不可用候选，期限覆盖所有等待路径 |
+| 恢复与语义测试 | A 失效转 B、A 恢复、旧 epoch 探测、重复 WRITE、RNR 耗尽 | 有证据再恢复，未知结果不伪装未执行，遵守业务重放契约 |
+| 真实硬件对照 | 相同 profile、独立故障域、业务约定下比较 bonding 与物理 TENT | 检查数据正确性、内存安全、检测/切换/回切时间、吞吐与尾延迟 |
 
-这些值进入每个任务的 runtime policy。一个任务的后续恢复使用其保存的策略，不是每轮都无条件读取最新全局配置。
-
-默认 3 的含义是最多进行 3 次额外 failover 解析尝试；初始提交不计入该值。候选数量不足时，会更早失败。
-
-存在特殊接口边界：要求提交后可取消的 scatter 路径会将恢复预算设为 0，并关闭轮询自动 failover，不能把普通请求默认值套到这类路径。
-
-源码定位：`tent/include/tent/common/config_lifecycle.h:128`；`tent/src/runtime/transfer_engine_impl.cpp:2091`。
-
-### 6.5 提交阶段失败也可以恢复
-
-`commitPreparedSubmit()` 调用后端 `submitTransferTasks()`。如果返回失败，runtime 会调用 `attemptSubmitStageFailover()`，尝试剩余候选。
-
-这已经实现，不能依据旧文档中“submit-stage 不恢复”的过时段落得出相反结论。
-
-合并请求的 owner 与 alias 尤其重要：
-
-- 一个物理 owner 对应真正提交的数据搬运。
-- 多个 public alias 只映射到该 owner。
-- 恢复只重发 owner。
-- alias 同步 owner 的 transport、sub-task 和状态。
-
-否则，一次合并请求可能被每个 alias 重发一遍。部分接收语义还必须由 transport 的提交契约正确处理，不能仅从非 OK 返回值推断所有旧工作都没有开始。
-
-源码定位：`tent/src/runtime/transfer_engine_impl.cpp:2327`、`:3039`；相关回归见 `engine_failover_e2e_test.cpp`。
-
-### 6.6 轮询观察到失败后的状态机
-
-`updateTaskStatusAfterPoll()` 的主要条件可简化为：
-
-```cpp
-// 简化伪代码，省略指标和 alias 同步。
-if (!allow_failover || task.cancel_requested ||
-    task.suppress_failover || status != FAILED ||
-    task.type == UNSPEC) {
-    return;
-}
-while (task.failover_count < task.max_failover_attempts) {
-    if (resubmitTransferTask(task).ok()) {
-        task.status = PENDING;
-        break;
-    }
-}
-```
-
-`resubmitTransferTask()` 增加失败切换计数，更新候选下标，重新解析路由，分配目标后端的 SubBatch，再提交原始逻辑请求。
-
-如果下一后端也同步拒绝，runtime 可以在同一预算内继续寻找后面的候选。若新后端接受工作，返回 PENDING，下一次 progress 再观察完成，不在该函数里无界等待。
-
-如果选择结果包含 staging 参数，恢复会再次交给 ProxyManager，不能把原始设备内存地址直接提交给 host-only 后端。
-
-源码定位：`tent/src/runtime/transfer_engine_impl.cpp:2966`、`:3157`。
-
-### 6.7 为什么 getTransferStatus 有时会改变运行状态
-
-当 `enable_auto_failover_on_poll=true` 时，查询状态可以触发内部重提交流程。因此它并不总是纯观察接口。
-
-如果该开关关闭，`getTransferStatus()` 不自动执行这类恢复，但 `progressBatch()`、`waitTransferCompletion()`、`transferSync()` 对应的推进路径仍可以恢复。
-
-不能依赖默认始终存在后台线程推进所有请求：独立 `enable_progress_worker` 默认关闭，runtime queue 开启时会启用它；应用也可以通过显式 progress/等待接口驱动。
-
-### 6.8 哪些失败不能自动重放
-
-当前代码不会无条件对所有失败重新发起数据写入：
-
-- 用户主动取消后不应恢复。
-- 参数、权限、范围或协议等永久错误不能靠换后端修好。
-- 普通 TCP 的某些不确定 WRITE 结果会设置 `suppress_failover`。
-- HP-TCP 对丢失 ACK 导致远端结果未知的 WRITE，以及有效的永久拒绝，也会抑制重放。
-- HP-TCP 元数据过期有单独的有界刷新重试路径。
-- 轮询通用跨后端逻辑要求状态为 FAILED，不是看到任意 TIMEOUT 或 CANCELED 就重发。
-
-TENT 因而不能被描述为通用的 exactly-once 事务系统。相同内容写同一内存位置在一些 KV Cache 场景可重复，但这不等于允许所有带副作用业务安全重放。
-
-源码定位：`tent/src/runtime/transfer_engine_impl.cpp:3070`。
-
-## 7. 将四项能力放回一个具体场景
-
-假设一个进程需要把远端 GPU 中的 KV Cache 读到本地 GPU：
-
-1. 应用提交 READ，请求指明本地接收指针、远端 Segment、远端注册地址和长度。
-2. runtime 获取 Segment 元数据，匹配策略并检查后端能力。
-3. 如果硬件和注册资源支持直接 GPU RDMA，后端可直接执行。
-4. 如果当前支持的规则要求 host staging，ProxyManager 把请求拆成远端设备到 host、host 网络传输、本地 host 到设备三阶段。
-5. 网络阶段若选中 RDMA，RDMA 可以再把该 chunk 切成多个 slice，在允许的 NIC/rail 上执行。
-6. slice completion 释放在途计数，产生带宽样本，影响后续 slice 的路径分配。
-7. 单个 rail 出错时，transport 尝试内部恢复；失败扩大到逻辑任务时，runtime 在候选及预算内重新解析。
-8. staged 路径失败时，尚未排空的中转资源由清理机制继续持有，避免过早复用。
-9. 应用只有在整个逻辑请求终态成功时，才可以认为所有目标数据均可用。submit 成功只表示提交阶段被接受。
-
-这里第 5 步揭示了两个粒度：staging 的 chunk 是编排和 buffer 复用单位，RDMA slice 是设备传输和调度单位。两者不是同一个对象。
-
-## 8. 默认值、开关与实现边界速查
-
-| 项目 | 当前值或行为 | 解读 |
-|---|---|---|
-| 构建 `USE_TENT` | 默认 OFF | 必须构建相应能力 |
-| 兼容 API 启用 TENT | `MC_USE_TENT=1` | 原生 TENT API 不依赖这个兼容层开关 |
-| RDMA 智能调度 | 默认 true | 关闭后采用基线轮询 |
-| RDMA 基础 block | 默认 64 KiB | 对齐、片数限制和尾片合并可改变实际大小 |
-| RDMA slice 计数上限 | 一般 64；CUDA 本地内存或 WRITE 为 32 | 不代表每次都会分这么多片 |
-| RDMA 带宽旧值系数 | 默认 0.01 | 新样本权重约 99% |
-| ProxyManager chunk / arena | 4 MiB / 64 chunks | 每个 location 按需建立 arena |
-| event-loop buffer 数量 | 至多 16 组 | 属于单 staging 任务的循环复用 |
-| runtime failover 预算 | 默认 3 | 受每任务策略和候选数共同限制 |
-| 轮询自动 failover | 默认 true | 查询可触发恢复 |
-| runtime queue | 默认 false | 与 transport 内部 slice 队列不同 |
-| deadline 降级阈值 | 默认 0，关闭 | 不应当成默认行为 |
-| 独立 progress worker | 默认 false | runtime queue 开启时会启用 |
-| UB 选择 | 单独的 rail 评分与 quota | 不使用 RDMA 的评分公式 |
-| 跨 transport 慢链路切换 | 没有通用延迟触发机制 | 不等同于失败恢复 |
-| 任意多跳路径搜索 | 没有通用图搜索实现 | staging 依赖已编码设备模式 |
-
-此前 Review 分析中发现的限制在本基线仍应保留认知：admission 的带宽按 transport 区分，但 `dispatching_bytes_` 仍是 eligible owner 的共享计数；UB 极小 endpoint cache 也可能与候选解析数量冲突。它们分别位于可选 admission 和 UB 候选生命周期路径，不应因为本文解释了设计目标，就认为这些边界已自动消失。
-
-## 9. 对照现有测试阅读
-
-下表是现有测试入口，不表示本次执行过这些测试：
-
-| 能力 | 测试文件 | 阅读重点 |
-|---|---|---|
-| transport 策略 | `tent/tests/transport_selector_test.cpp` | 策略匹配、intent、能力、设备 mask |
-| hint 与提交分组 | `tent/tests/transport_hint_test.cpp` | hint 授权、混合请求、策略分组 |
-| RDMA 设备选择 | `tent/tests/device_selector_test.cpp` | 负载分配、计数、带宽估计 |
-| RDMA rail 状态 | `tent/tests/rail_monitor_test.cpp` | 受控探测、Half-Open、退避和恢复 |
-| staging arena | `tent/tests/stage_buffer_concurrency_test.cpp` | 共享缓冲并发所有权 |
-| staging 退出 | `tent/tests/proxy_shutdown_timeout_test.cpp` | 未排空 Batch 与延迟释放 |
-| runtime failover | `tent/tests/engine_failover_e2e_test.cpp` | 提交阶段、轮询阶段、alias、预算 |
-| UB 数据与恢复 | `tent/tests/ub_native_data_path_test.cpp` | 缺失 completion、fence、后续进展 |
-| UB 资源管理 | `tent/tests/ub_teardown_test.cpp`、`tent/tests/ub_core_test.cpp` | quarantine、设备清理、rail 配额与选择 |
-
-其中 `engine_failover_e2e_test.cpp` 包含 `SubmitStageFailureFailsOverToSecondary`、`PollStageFailoverWithDerivedTasksRunsOnce`、`PerTaskFailoverCountsAreIndependent` 等案例；UB 的 `ProviderLostCompletionIsReclaimedAfterSuccessfulFence` 则验证成功 fence 后回收 provider 遗失 completion 的资源。
-
-fake transport / fake URMA 能确定性验证状态与资源计数，但不能代替真实 DMA 完整性、物理设备失效和跨节点性能测试。
-
-## 10. 推荐源码阅读顺序
-
-以下路径均相对于仓库根目录：
-
-1. `mooncake-transfer-engine/tent/include/tent/common/types.h`：先掌握 Request 和状态。
-2. `mooncake-transfer-engine/tent/src/runtime/transfer_engine_impl.cpp`：从 `prepareSubmit()` 跟到 `commitPreparedSubmit()`。
-3. `mooncake-transfer-engine/tent/src/runtime/transport_selector.cpp`：策略、hint、能力和候选。
-4. `mooncake-transfer-engine/tent/include/tent/transport/rdma/slice.h`：切片计划和任务计数。
-5. `mooncake-transfer-engine/tent/src/transport/rdma/rdma_transport.cpp`：请求变成 slice 的位置。
-6. `mooncake-transfer-engine/tent/src/transport/rdma/quota.cpp`：设备评分、分配与带宽反馈。
-7. `mooncake-transfer-engine/tent/src/transport/rdma/workers.cpp`：本地/远端 rail、post、completion 和重试。
-8. `mooncake-transfer-engine/tent/src/runtime/proxy_manager.cpp`：stage 子请求、chunk 状态机与清理。
-9. `mooncake-transfer-engine/tent/src/transport/rdma/rail_monitor.cpp`：rail 状态转换。
-10. 回到 `transfer_engine_impl.cpp` 的 `pollTaskStatus()`、`resubmitTransferTask()`、`updateTaskStatusAfterPoll()`：把物理故障与逻辑恢复连接起来。
-11. `mooncake-transfer-engine/tent/src/transport/ub/workers.cpp`：比较 UB 与 RDMA 的实现差异。
-
-理解这条链路之后，四项能力的关系是明确的：runtime 先确定候选与编排方式，transport 再安排实际切片和设备，完成处理反馈负载与健康状态，错误则沿相应层级触发有界恢复。
+物理 UB 方案可以复用 TENT 已有的大部分管理和调度框架；需要补齐的是路径证明、恢复闭环和明确的安全契约，而不是重新实现全部 bonding provider。
