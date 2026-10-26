@@ -1,6 +1,6 @@
 # TENT 与 Mooncake Store 的 UB 节点级故障隔离方案
 
-> 日期：2026-10-22。
+> 更新日期：2026-10-26。新增端口级、节点级状态机与 Client/Store 隔离、恢复时序图。
 >
 > Supercache 分析基线：`main_learn`，`c03a339f`。UMDK 基线：`09086da5d86c53f83eb395109d636957d3efcc79`。
 >
@@ -219,6 +219,43 @@ BAD 与 GOOD 都有有效期和观测范围，具体窗口由目标 provider 与
 
 provider 查询启动时记录目标端口的当前 revision；查询完成时若期间已收到较新 status 4，不能仅因“查询返回得晚”就覆盖它。只有具备可验证采样因果关系的结果才提交，否则重新核验。
 
+### 4.6 端口级状态机
+
+下图表示单个物理端口的隔离与恢复状态。`Isolated` 是失败隔离锁存，不等于 BAD 证据永久有效；`Recovering` 只允许恢复控制流，普通业务继续被拦截。图中所有证据都须通过第 4.2—4.5 节的归属、时效与代次检查。
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    state "Unknown：待核验" as PortUnknown
+    state "Good：当前健康" as PortGood
+    state "Isolated：业务隔离" as PortIsolated
+    state "Recovering：恢复核验" as PortRecovering
+
+    [*] --> PortUnknown
+    PortUnknown --> PortGood: 合格 GOOD
+    PortUnknown --> PortIsolated: 有效 BAD（含 status 4）
+    PortUnknown --> PortUnknown: 弱证据或查询失败
+    PortGood --> PortUnknown: 健康事实过期
+    PortGood --> PortIsolated: 新的有效 BAD
+    PortIsolated --> PortIsolated: 过期或查询失败
+    PortIsolated --> PortRecovering: 启动恢复
+    PortRecovering --> PortIsolated: 核验失败或新 BAD
+    PortRecovering --> PortRecovering: 尚未通过恢复屏障
+    PortRecovering --> PortGood: 恢复核验通过
+```
+
+状态转换的影响范围：
+
+| 转换 | 端口处理 | 对节点状态的影响 |
+| --- | --- | --- |
+| Unknown/Good → Isolated | 从新业务候选中移除端口；已接受 WR 继续完成或排空 | 重新评估完整端口集合，不能仅凭本端口 BAD 阻断节点 |
+| Isolated → Isolated，BAD 已过期 | 保留端口隔离，将事实标记待核验 | 不能用过期 BAD 新增全故障结论；已有节点阻断保持 |
+| Isolated → Recovering | 只开放限额恢复资源，不提前发布 GOOD | 不解除节点阻断 |
+| Recovering → Good | 原子提交新恢复代次与合格健康事实 | 若已满足节点解封条件，解除全故障阻断 |
+| Good → Unknown | 失去新鲜健康事实；不自动生成 BAD | 节点转为待核验/退化，具体路径按请求规则处理 |
+
+恢复核验可以采用合格 provider GOOD 或受控数据探测，不要求每次都新增一次硬件探测；不论来源，都要先经过恢复屏障和版本复核。核验失败回到 Isolated 只表示保留原隔离，不将探测失败自动新增为物理端口 BAD，也不延长原 BAD 的有效期。旧实例退出或 inventory/device epoch 改变时，退休旧状态机，按受控重配置创建新实例，不能把旧状态直接赋给新端口。
+
 ## 5. 节点状态机与准入
 
 ### 5.1 状态定义
@@ -287,6 +324,65 @@ AND 资源可用、提交期限尚未超出
 状态检查与实际 post 之间需要提交门禁同步，避免检查后端口进入 BAD，但新 WR 仍越过原生提交边界。
 
 节点阻断停止新的 UB 尝试，不直接丢弃已接受 WR；在途 WR 继续完成或进入排空。当前请求仍使用原始执行结果，不因健康状态变化伪造成功或未执行。
+
+### 5.4 节点级状态机
+
+节点状态由所有相关端口的同版本快照派生，并叠加全故障锁存。下图是端口所有者的本地状态机；远端消费者在独立 Query 核验后更新自己的 peer admission，可能短暂落后，不能把远端视图当作所有者事实源。
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    state "Unknown：事实不足" as NodeUnknown
+    state "Available：全部健康" as NodeAvailable
+    state "Degraded：退化或待核验" as NodeDegraded
+    state "Unavailable：全故障锁存" as NodeUnavailable
+    state "Reconfiguring：变更门禁" as NodeReconfiguring
+
+    [*] --> NodeUnknown
+    NodeUnknown --> NodeAvailable: ALL_GOOD
+    NodeUnknown --> NodeDegraded: PARTIAL
+    NodeUnknown --> NodeUnavailable: ALL_BAD
+    NodeAvailable --> NodeDegraded: PARTIAL
+    NodeAvailable --> NodeUnavailable: ALL_BAD
+    NodeDegraded --> NodeAvailable: ALL_GOOD
+    NodeDegraded --> NodeUnavailable: ALL_BAD
+    NodeUnavailable --> NodeUnavailable: PENDING
+    NodeUnavailable --> NodeDegraded: RECOVER_ANY
+    NodeUnavailable --> NodeAvailable: RECOVER_ALL
+
+    NodeUnknown --> NodeReconfiguring: RECONFIG
+    NodeAvailable --> NodeReconfiguring: RECONFIG
+    NodeDegraded --> NodeReconfiguring: RECONFIG
+    NodeUnavailable --> NodeReconfiguring: RECONFIG
+    NodeReconfiguring --> NodeReconfiguring: NOT_READY
+    NodeReconfiguring --> NodeUnknown: READY_UNKNOWN
+    NodeReconfiguring --> NodeDegraded: READY_PARTIAL
+    NodeReconfiguring --> NodeAvailable: READY_GOOD
+    NodeReconfiguring --> NodeUnavailable: BLOCKED
+```
+
+为避免图中长标签重叠，迁移条件缩写定义如下，不能只按名称跳过完整检查：
+
+| 条件 | 完整含义 |
+| --- | --- |
+| ALL_BAD | 完整非空清单中，每个端口都有同实例、同清单版本的当前有效 BAD |
+| ALL_GOOD | 完整非空清单中全部端口当前合格 GOOD，无待核验 |
+| PARTIAL | 有部分 BAD、未知、健康过期或待核验，未满足首次全故障条件 |
+| PENDING | 查询失败、BAD 过期、status 9、旧结果；保持已有阻断 |
+| RECOVER_ANY | 任一端口通过合格恢复与屏障，其余仍 BAD 或未知 |
+| RECOVER_ALL | 全故障解除条件通过，且全部端口当前健康 |
+| RECONFIG / NOT_READY | 受控清单/资源变更；清单不完整或资源尚未就绪则保持门禁 |
+| READY_UNKNOWN | 新完整清单和资源就绪，无历史阻断，端口事实待核验 |
+| READY_PARTIAL | 新清单和资源就绪，合格恢复依据允许放行，但仍有退化 |
+| READY_GOOD | 新清单和资源就绪，全部端口合格 GOOD |
+| BLOCKED | 新集合全部当前有效 BAD，或继承尚未解除的历史阻断 |
+
+两类门禁独立生效：
+
+- `Unavailable` 表示已经确认的全故障锁存；status 4 可以直接使本地状态进入该状态。
+- `Reconfiguring` 表示配置/资源变更期间不允许提交，不能通过把新端口设为 UNKNOWN 来清除历史故障。
+- `Unknown/Available/Degraded` 不代表请求必然能发送，仍须满足第 5.3 节的提交条件。
+- 任一合格 GOOD 足以解除全故障阻断；如果其他端口仍 BAD，节点应为 Degraded，不能宣称全部恢复。
 
 ## 6. TENT 的具体改造点
 
@@ -494,6 +590,166 @@ status 9 或 ACK timeout 触发 peer 查询、路径隔离和探测，不直接�
 
 如果新集合为空，应标记未配置/不可服务 UB，而不是构造“零个端口全部故障”。
 
+### 9.5 Store 服务实例全端口故障：Client 与 Master 隔离时序
+
+图中 S 是持有内存 Segment 的 Store 服务实例，C 是访问它的 Client。S 的 status 4 来自其本地发起的 WR、迁移或受控探测；常见 Client READ 的被动读源不会因此自动收到一次对应的 WR 完成。C 仅观察到 status 9 时，应 Query S，不能自行把它转换成 S 的全端口 BAD。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as S 本地 URMA 完成
+    participant T as S 侧 TENT
+    participant H as S 端口账本与节点准入
+    participant C as Client 与其 TENT 健康表
+    participant M as Store Master 健康表与分配器
+
+    D->>T: P0 当前有效 status 4
+    T->>H: 精确归属并提交 P0 BAD
+    H->>T: 隔离 P0，节点 Degraded
+    Note over T,H: P1 未确认 BAD 时，不新增节点全故障阻断
+    D->>T: P1 当前有效 status 4
+    T->>H: 提交 P1 BAD，复核完整清单与有效期
+    H->>H: 全部端口有效 BAD，锁存 Unavailable
+    H->>T: 立即关闭 S 的普通 UB 提交门禁
+    Note over T,H: 不等待 provider 查询；在途 WR 继续完成或安全排空
+
+    H-->>C: 被动故障摘要，含 incarnation 与 block_id
+    H-->>M: 被动故障摘要
+    C->>H: 独立 QueryUbNodeHealth
+    H-->>C: 当前证据账本与锁存状态
+    C->>C: 校验身份、清单、时效，阻断 S 的 peer UB
+    M->>H: 独立 QueryUbNodeHealth
+    H-->>M: 同一实例的当前阻断事实
+    M->>M: 从需 UB 的新分配候选中排除 S
+    Note over C,M: Query 读取 status 4 账本，不要求再查询 provider
+
+    C->>M: 后续 PutStart，需要可行的 UB 目标
+    M-->>C: 分配其他合格目标，或返回无可用目标
+    C->>C: 读已有 S 副本时过滤其 UB eligibility
+    Note over C,M: 允许且已验证的其他 Transport 可另选；不删除副本或 Unmount
+```
+
+图中 Query 均为建议新增的控制面能力。Master 可经可信核验服务共享同等核验结果，但不得把未核验被动摘要直接当作确定隔离事实。Query 失败时，尚未阻断的视图保持 Suspect，已有阻断保持；实际请求仍由 TENT 提交门禁保护。
+
+### 9.6 Store 任一端口恢复：Client 与 Master 恢复时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as S 恢复协调器
+    participant P as S 的 P0 与旧资源
+    participant H as S 端口账本与节点准入
+    participant C as Client 与其 TENT 健康表
+    participant M as Store Master 健康表与分配器
+
+    Note over R,H: 初始 S=Unavailable，P0/P1 均曾有效 BAD
+    R->>P: 预留恢复代次，排空或隔离旧资源
+    alt 安全条件或资源重建尚未满足
+        P-->>R: fence 失败或资源尚未就绪
+        R->>H: 保持 pending 与全故障阻断
+        Note over R,M: 继续后台恢复；不因冷却结束或 TCP 成功解封
+    else 可以执行合格恢复核验
+        R->>P: 限额探测或取得合格 provider GOOD
+        P-->>R: 当前恢复代次的有效 GOOD
+        R->>H: 复核无较新故障，提交 P0 GOOD 与新 epoch
+        H->>H: 清除全故障锁存，P1 仍 BAD，节点 Degraded
+        H-->>C: 恢复摘要，仅触发核验
+        H-->>M: 恢复摘要，仅触发核验
+        C->>H: 独立 Query，携带期望 incarnation
+        H-->>C: 当前清单、恢复事实与新 health_epoch
+        C->>C: 核验通过，解除对 S 的 peer UB 阻断
+        M->>H: 独立 Query
+        H-->>M: 合格的新恢复事实
+        M->>M: S 重新参与合法分配候选
+        Note over C,M: 不强制选 S，也不要求等待 P1 恢复
+
+        C->>C: 后续请求复核 P0 路径、注册、代次与配额
+        alt 请求级检查通过
+            C->>P: 经合格 P0 路径提交 READ 或 WRITE
+        else 请求级路径或资源仍不合格
+            C->>C: 选其他合法路径或副本，或有界失败
+        end
+        P-->>H: 旧恢复代次的 status 4 迟到
+        H->>H: 不覆盖新 GOOD；旧请求仍按原规则清理
+    end
+```
+
+解除阻断表示重新允许调度，不代表旧 buffer 描述或 Endpoint 自动可复用；Store/TENT 必须使用匹配的新注册与设备代次。若 Query 返回 pending-only、陈旧缓存或身份不匹配，C/M 不执行图中的解封步骤，并继续去重核验任务。
+
+### 9.7 Client 实例全端口故障：本地与 Store peer 隔离时序
+
+图中 C 是 READ/WRITE 的实际发起实例。Store 仅在持有 C 的 peer 资源、需要向 C 发起传输等场景消费 C 的健康；普通 Client 拉取 READ 的快速止损首先发生在 C 本地。纯访问 Client 的故障不需要 Master 删除 Store 副本或禁止其他健康 Client 访问。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as 应用
+    participant T as Client C 的 TENT
+    participant H as C 端口账本与节点准入
+    participant D as C 本地 URMA 完成
+    participant S as Store 传输端与 peer 健康表
+
+    A->>T: 发起 READ 或 WRITE
+    D->>T: P0 当前有效 status 4
+    T->>H: 记录 P0 BAD
+    H->>T: 禁用 P0，保留其他合格路径
+    D->>T: P1 当前有效 status 4
+    T->>H: 记录 P1 BAD，当前完整集合全部 BAD
+    H->>H: C 节点准入变 Unavailable
+    H->>T: 立即拒绝 C 新的普通 UB 尝试
+    Note over T,H: 在途请求不伪造完成，先完成或排空
+    H-->>S: C 的故障摘要，按相关 peer 订阅传播
+    S->>H: 独立 QueryUbNodeHealth
+    H-->>S: 当前实例的 status 4 账本与阻断状态
+    S->>S: 核验后阻断向 C 发起的 UB 传输
+
+    A->>T: 后续 Get、Put 或迁移请求
+    alt 只有 UB 可用或策略固定 UB
+        T-->>A: 快速返回 UB 不可用，不重复撞故障端口
+    else 允许且具备其他可行 Transport
+        T->>T: 按策略重新检查替代 Transport 与重放安全
+        T-->>A: 沿替代流程返回实际结果
+    end
+    Note over A,S: RPC/TCP 可用不清除 C 的 UB 阻断；不改变对象所有权
+```
+
+应用入口可以在 PutStart 或准备传输资源前读取 C 的 UB eligibility，减少无效分配，但底层提交门禁不可省略。如果 C 同时承载已挂载的 Store Segment，其服务实例对应的 UB 访问也按同一健康事实过滤，而不是扩大为整台主机故障。
+
+### 9.8 Client 任一端口恢复：本地与 Store peer 恢复时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as 应用
+    participant T as Client C 的 TENT
+    participant R as C 恢复协调器与 P0 资源
+    participant H as C 端口账本与节点准入
+    participant S as Store 传输端与 peer 健康表
+
+    Note over T,H: C=Unavailable，恢复控制流独立于普通业务门禁
+    R->>R: 处理旧 DMA 与资源，建立候选恢复代次
+    R->>R: 执行受限 P0 核验，收集候选恢复证据
+    R->>H: 提交 GOOD、恢复屏障与并发复核结果
+    alt GOOD 合格且没有更晚的有效故障
+        H->>H: 清除全故障阻断，P1 仍 BAD，C=Degraded
+        H->>T: 发布本地新 health_epoch，允许请求级检查
+        H-->>S: C 恢复摘要，不直接解除远端阻断
+        S->>H: 独立 Query，校验预期 incarnation
+        H-->>S: 当前清单与合格 P0 恢复事实
+        S->>S: 校验通过，解除对 C 的 peer UB 阻断
+
+        A->>T: 新的 READ 或 WRITE
+        T->>T: 复核本地端口、peer admission、路径、注册与配额
+        T-->>A: 返回实际传输结果
+        Note over T,S: Store 后续向 C 发起传输时也做自己的请求级复核
+    else fence 未完成、GOOD 陈旧或出现新的 BAD
+        H->>H: 保持 Unavailable 与待核验
+        H->>T: 继续拒绝普通 UB，保留受限恢复入口
+    end
+```
+
+本地恢复与 Store 的 peer 视图可以短暂不同步，双方分别遵守本地门禁与独立核验规则。没有新业务也必须继续后台恢复；重复恢复通知不得创建多个查询任务。恢复后新产生的有效 status 4 仍可重新隔离端口，并在完整集合再次全部 BAD 时重新阻断节点。
+
 ## 10. 并发、资源与观测
 
 ### 10.1 并发规则
@@ -611,6 +867,6 @@ A/B 可以验证“status 4 足以触发隔离”；不能只实现阻断而没�
 | U3 | `src/urma/lib/urma/bond/bondp_datapath.c`、`src/urma/lib/urma/bond/bondp_dp_health.c` | bonding 中端口 BAD 标记与恢复更新 |
 | U4 | `src/urma/lib/urma/core/include/urma_opcode.h` | 原始 CR 定义；provider 契约与归属适配不可省略 |
 
-本次仅提交设计文档与基础设计中的关联链接，没有实现上述代码、修改运行配置或开展 UB 硬件测试。文档的可执行验收要求列在第 11 节，不能用源码分析代替硬件结果。
+本文仍为待实现设计。本次刷新补充两张状态机与四张 Client/Store 隔离、恢复时序图，没有实现上述代码、修改运行配置或开展 UB 硬件测试。文档的可执行验收要求列在第 11 节，不能用源码分析代替硬件结果。
 
-文档检查覆盖 UTF-8、文件结尾、空白、冲突标记、代码围栏、本仓库相对链接和 UMDK 引用路径。已尝试 `docs/make.bat html`，但本机缺少 `sphinx-build`；`pre-commit` 及其 Python 模块也未安装，相关检查未完成。文件位于 `docs/analyze/`，未修改 Sphinx 导航。
+文档检查覆盖 UTF-8、文件结尾、空白、冲突标记、代码围栏、本仓库相对链接和 UMDK 引用路径。六张 Mermaid 图已使用 Mermaid 11.14.0 在 Chromium 中完成语法解析与 SVG/PNG 渲染，并检查可读性；渲染产物位于临时目录，不纳入提交。已尝试 `docs/make.bat html`，但本机缺少 `sphinx-build`；`pre-commit` 及其 Python 模块也未安装，相关检查未完成。文件位于 `docs/analyze/`，未修改 Sphinx 导航。
