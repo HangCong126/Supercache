@@ -5,6 +5,8 @@
 > 本文替代上一版传输组共用 lane 方案：保留逐 slice 选路，每个在途 slice attempt 独占一个发送 Jetty，通过单请求在途上限控制池占用。
 > 关联：[物理 UB 分片与可靠性](tent-physical-ub-reliability-design.md)、[UB 节点隔离](ub-node-fault-isolation-design.md)、[UBTransport 组件化](ub-transport-component-design.md)、[线程模型](ub-threading-model-analysis.md)。
 
+> 后续综合方案：[TENT 物理 UB RM 通信组件一体化设计](tent-ub-rm-integrated-design.md)。组件、线程、实际 buffer owner、事件、预算与物理 provider 门槛以综合方案为准；本文保留池化分项背景。
+
 ## 1. 核心决定与范围
 
 **每个物理 EID/Context 建立有界 RM 发送池。每个 slice 独立选择路径，确定 Context 后独占借一个 Jetty，完成本次 attempt 的硬件责任且同步 post 退出后归还。**
@@ -16,7 +18,7 @@
 | 设备范围 | 非 bonding 物理 UB，CPU DRAM 单边 READ/WRITE |
 | 池边界 | 物理设备 + EID + 本地 Context incarnation |
 | 池大小 | 每 Context 静态配置；50 仅为算例 |
-| 借用粒度 | 一个 slice 的一次 attempt，当前实现通常提交一个 WR |
+| 借用粒度 | 一个 slice 的一次 attempt，最多一次 native post，入参严格一条 WR；重试新建 attempt |
 | 防止请求占满池 | 一个 Task 在所有 EID 上合计最多 K 个已准入 attempt |
 | 远端目标 | 每个 endpoint 管理自己的目标 Jetty，不设置全 Context 单一共享目标 |
 | 正常归还 | 接受范围明确、全部硬件责任终结、同步 post 退出、资源健康、一次认领 |
@@ -212,7 +214,7 @@ acceptance_resolved
 
 确定零 WR 被接受时，仍需 post 退出且资源健康，才可直接归还。接受结果不明时保留责任并退役；CQE 与 post 返回必须共同驱动同一个完成门，不能发布逻辑完成后仍无保护地访问 Inflight。
 
-UbTask::seal 仍只表示切片集合已构造。此方案没有 lease 生产者 Seal：一次 attempt 的提交范围在 post 前明确，归还取决于该 attempt 的接受和硬件终结事实，不等待整个 Task 完成。
+UbTask::seal 仍只表示切片集合已构造。此方案没有 lease 生产者 Seal：每 attempt 通过一次性提交认领，最多调用一次 native post，且入参恰好一条 WR；worker、grant、timer 和 callback 均不得追加 WR。post 返回仅表示同步调用退出，归还仍取决于接受和硬件终结事实，不等待整个 Task 完成。
 
 ## 8. 容量、排队与算例
 
@@ -223,7 +225,7 @@ UbTask::seal 仍只表示切片集合已构造。此方案没有 lease 生产者
 | Lane/JFC credits | 限制真实 native 队列和完成责任 | 确定未接受或真实终结，恰好一次 |
 | device/path quota | 保留当前在途 WR/字节上限和选路依据 | 对应 attempt 责任结算，幂等归还 |
 
-当前 worker 通常每 slice 提交一条 WR，因此每次 lease 通常只消耗一条 WR 的深度。即使 Jetty depth=256，本方案也不把其他 slice 填到同一已借 lane。这牺牲队列利用率，换取简单的独占模型；若吞吐不足，应评估该取舍，不能悄悄恢复 slice 共用。
+本设计严格规定每 attempt 最多一次 native post、恰好一条 WR，因此每次 lease 最多承担一条 WR 的责任。即使 Jetty depth=256，本方案也不把其他 slice 填到同一已借 lane。这牺牲队列利用率，换取简单的独占模型；若吞吐不足，应评估该取舍，不能悄悄恢复 slice 共用或同 attempt 多 WR。
 
 例如一个 Task 有 50 片，均选同一 Context，池容量 50、K=4：
 
@@ -248,7 +250,7 @@ flowchart LR
 | --- | --- |
 | 成功接受 | 保留 lease/permit/注册，等待真实终结 |
 | 确定零接受 | 回滚对应额度；健康 Jetty 归还，否则退役 |
-| 可信 accepted prefix | 前缀保留，确定未接受后缀取消；若一 slice 将来对应多 WR，全部责任终结后才归还该 lease |
+| 可信接受数量 | 本接口只能为 0 或 1；大于 1 属于契约违规，进入隔离，不采用多 WR 前缀/后缀模型 |
 | 接受范围不明 | 保留所有可能责任、停止该 attempt，进入安全退役 |
 | 重复/迟到 CQE、未知 token | 不重复完成、归还或扣减 |
 | flush/done 等控制记录 | 先分类，不作为新的业务完成直接解引用 user_ctx |

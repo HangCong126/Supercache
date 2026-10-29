@@ -8,6 +8,8 @@
 >
 > 范围：基于物理 UB 设备与 URMA 的 CPU DRAM READ/WRITE、可配置切片传输、链路主动探测和安全恢复。这里的“单边收发”指 READ/WRITE，不包含双边 SEND/RECV。
 
+> 后续综合方案：[TENT 物理 UB RM 通信组件一体化设计](tent-ub-rm-integrated-design.md)。TENT RM 首版以该文为准，仅采用专用 post/poll 线程池；本文的 Manual progress 不属于首版交付范围。
+
 ## 1. 目标与边界
 
 将现有 TENT 原生 UBTransport 的可复用能力抽成独立 UbEngine，使其他应用无需启动完整 TENT runtime，即可使用：
