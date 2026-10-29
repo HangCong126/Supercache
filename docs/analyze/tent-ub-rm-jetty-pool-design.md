@@ -1,352 +1,345 @@
-# TENT 物理 UB：按 EID/Context 建立 RM Jetty 池与传输组复用设计
+# TENT 物理 UB：RM Jetty 池与 slice 级独占借还设计
 
-> 日期：2026-10-28；状态：待实现，未完成物理 UB RM 实机验收。
-> 代码分析基线：Supercache `main_learn` / `fe9155c9`。
-> 本文承接此前《非 bonding 物理 UB Jetty 复用与生命周期设计（RC / RM）》的 RM 分支，细化最新 TENT 接入；不要求本分支存在旧文档，也不修改当前 RC 实现。
+> 日期：2026-10-29；状态：待实现，未完成物理 UB RM 实机验收。
+> 代码分析基线：Supercache `main_learn` / `fe9155c9`；本次只更新设计文档。
+> 本文替代上一版传输组共用 lane 方案：保留逐 slice 选路，每个在途 slice attempt 独占一个发送 Jetty，通过单请求在途上限控制池占用。
 > 关联：[物理 UB 分片与可靠性](tent-physical-ub-reliability-design.md)、[UB 节点隔离](ub-node-fault-isolation-design.md)、[UBTransport 组件化](ub-transport-component-design.md)、[线程模型](ub-threading-model-analysis.md)。
 
-## 1. 核心结论与交付范围
+## 1. 核心决定与范围
 
-**每个本地物理 EID/Context 拥有一个有界 RM 发送 Jetty 池。先选合法路径，再按有界传输组借一个 Jetty，同组多个 slice/WR 共用该 Jetty，封口且硬件责任收敛后一次归还。**
+**每个物理 EID/Context 建立有界 RM 发送池。每个 slice 独立选择路径，确定 Context 后独占借一个 Jetty，完成本次 attempt 的硬件责任且同步 post 退出后归还。**
 
-这是 RM 资源组织方案，不是把当前 jetty_per_endpoint 改成 50。当前真实 adapter 使用 RC、endpoint 拥有绑定 Jetty；RM 的创建、目标导入、握手和资源所有权均需修改。
+不采用 Group、组窗口、请求内 lane 映射或 lease 生产者 Seal。不同在途 slice 不并发共用发送 Jetty；同一 native Jetty 可在不同 slice 之间顺序复用。
 
 | 项目 | 本文决定 |
 | --- | --- |
 | 设备范围 | 非 bonding 物理 UB，CPU DRAM 单边 READ/WRITE |
-| 池边界 | 物理设备 + EID + 本地 context incarnation |
-| 池大小 | 每 context 静态配置；50 为算例，非已验证默认值 |
-| 借用粒度 | 同 task 的有界窗口、同本地 context、同远端目标、同方向组成的传输组 |
-| slice 与 Jetty | 一个组一个 lease；组内多 WR 占队列深度，不各借一个 Jetty |
-| 池归还 | 生产者封口、pending=0、同步 post 退出、资源仍 ACTIVE、一次结算 |
-| RC 兼容 | 保留当前连接绑定模式，不混入 RM 池；零 WR 阶段确定协议 |
-| 本轮非目标 | bonding 虚拟化、RC 跨 peer 重绑、动态扩池、新节点评分或全局公平框架 |
+| 池边界 | 物理设备 + EID + 本地 Context incarnation |
+| 池大小 | 每 Context 静态配置；50 仅为算例 |
+| 借用粒度 | 一个 slice 的一次 attempt，当前实现通常提交一个 WR |
+| 防止请求占满池 | 一个 Task 在所有 EID 上合计最多 K 个已准入 attempt |
+| 远端目标 | 每个 endpoint 管理自己的目标 Jetty，不设置全 Context 单一共享目标 |
+| 正常归还 | 接受范围明确、全部硬件责任终结、同步 post 退出、资源健康、一次认领 |
+| RC 兼容 | 保留原连接绑定路径，与 RM 分池，首个 WR 前确定协议 |
 
-不承诺仅因池化提高带宽，也不把物理 Jetty 与端口画成一一对应关系。
+这里的“不公用”有两个明确边界：本地发送 Jetty 不同时出租给两个 slice；远端取消全 Context 共享目标，但同一个 endpoint 的目标仍可接收该连接的多个 WR，不为每个 slice 创建远端 Jetty。
 
-## 2. EID、Context、端口与池的边界
+代价是借还频率提高，且不再保证同请求、同 EID 的切片使用同一个 Jetty。池化不承诺提高带宽，不增加动态池大小、节点权重或跨 peer 公平框架。
 
-Context 在创建时选择设备 EID，Jetty 继承其 EID/UASID。一个 context 可以创建多个不同 ID 的 Jetty；相同 EID 的不同 context 仍是独立注册和资源域，不能按 EID 字符串直接混池。
+## 2. Context、EID、端口和资源预算
 
-| EID 类型 | 端口含义 | 池化含义 |
+Context 由设备和 eid_index 创建，Jetty 关联该 Context 的 EID/UASID。eid_index 是设备 EID 表索引，不是端口号；Jetty ID 也不能脱离设备、EID/UASID 和代际识别资源。
+
+| EID 类型 | 与端口关系 | 对池的影响 |
 | --- | --- | --- |
-| port EID | 按相应部署契约受限于对应端口 | 多个池成员共享该可达范围，不是增加物理链路数 |
-| primary EID | 可访问所属 IODie 的允许端口集合 | 选定 context 不等于唯一确定出口物理端口 |
-| bonding EID | 聚合层虚拟身份 | 不属于本设计，不能把其逻辑 Jetty 当作本池物理成员 |
+| port EID | 按部署契约受限于对应端口 | 多个 Jetty 共享该端口可达范围，不增加物理链路数 |
+| primary EID | 可使用所属 IODie 允许的多个端口 | 选定 EID 不等于指定唯一出口端口 |
+| bonding EID | 聚合层虚拟身份 | 不属于本方案，不使用其成员或 chip 扩展契约 |
 
-拓扑节点采用当前 `ub:设备名:eid索引` 标识，但 eid_index 是设备 EID 表索引，不是端口号。完整池身份另带实际 EID 与 context incarnation；远端资源还需完整 EID/UASID/Jetty ID 和目标代际。
+相同 EID 的不同 Context 仍不能混池；池键包含 Context incarnation。当前拓扑名 `ub:设备名:eid索引` 可用于选择和诊断，不能单独承担资源代际围栏。
 
 ```mermaid
 flowchart TD
-    Device["一个或多个物理 UB 设备"] --> CA["Context A / EID A"]
-    Device --> CB["Context B / EID B"]
-    Device --> CC["Context C / EID C"]
-    Device --> CD["Context D / EID D"]
-    CA --> PA["发送池 A：50 个物理 Jetty"]
-    CB --> PB["发送池 B：50 个物理 Jetty"]
-    CC --> PC["发送池 C：50 个物理 Jetty"]
-    CD --> PD["发送池 D：50 个物理 Jetty"]
-    PA --> G0["组 G0 借 A7：多 slice 共用"]
-    PA --> G1["组 G1 借 A12：多 slice 共用"]
-    PB --> G2["组 G2 借 B3：多 slice 共用"]
+    Device["一个或多个物理 UB 设备"] --> A["Context A / EID A：发送池 50"]
+    Device --> B["Context B / EID B：发送池 50"]
+    Device --> C["Context C / EID C：发送池 50"]
+    Device --> D["Context D / EID D：发送池 50"]
+    A --> S0["slice S0 独占 A7"]
+    A --> S1["slice S1 独占 A12"]
+    B --> S2["slice S2 独占 B3"]
+    S0 --> Return["硬件责任收敛后归还原池"]
+    S1 --> Return
+    S2 --> Return
 ```
 
-四个 context 各 50 个 SEND Jetty，正常池成员共 200 个。若每 context 一个独立共享目标，再加 4 个目标 Jetty；retiring、quarantine、creating、legacy 和其他用户均另计。四个 EID 若共享同一设备，必须在设备级合并核算 max_jetty、JFC 及注册上限，不能各用一份完整设备额度。
+四个池各 50 个，正常 SEND 池成员为 200 个。endpoint 目标数量随连接数增长，不再是固定增加 4 个 Context 共享目标；目标、legacy RC、创建中、退役/quarantine 和其他资源均纳入总预算。
 
-## 3. 当前实现、目标行为与差异
+四个 EID 可能属于同一物理设备，max_jetty、JFC 和注册资源上限必须合并核算，不能每个 EID 各领取一份完整设备额度。endpoint 目标创建也必须有界，缓存上限不能代替真实 native 资源预算。
 
-| 环节 | 当前 TENT | 目标 RM 池化 |
+## 3. 当前 TENT 与目标行为
+
+| 环节 | 当前实现 | 本方案 |
 | --- | --- | --- |
-| 设备/context | 发现 EID，按 topology entry 创建 context | 保留，补 context 代际和池 owner |
-| Request 拆分 | UbTransport 拆成 slice，入队前 UbTask::seal | 保留逻辑 task；新增有界组和 lane 生产者封口 |
-| 选路 | worker 对每个 PendingSlice 选择本地/远端组合 | 组/窗口首次选择；组内固定路径，故障或新窗口再选择 |
-| Jetty 所有权 | endpoint 创建自己的 Jetty 集合，默认 6 个 | context 拥有发送池，endpoint 只持远端目标和身份 |
-| 发送 lane | endpoint->jetty(worker_index)，内部取模 | GroupState 持有 lease，worker 从组取得固定 Jetty |
-| provider 模式 | JFR/Jetty/import 固定 RC，并 bind | 显式支持 RM、导入 target、不执行 RC bind |
-| 握手 | 双方 endpoint Jetty 数量一致，逐个绑定 | 公布共享目标，发送池大小与对端目标数量解耦 |
-| 完成 | token、attempt、Inflight、quota 结算 | 在现有机制上增加 lease 引用及单 lane credits，不重建第二套完成系统 |
-
-代码依据：[UbTransport](../../mooncake-transfer-engine/tent/src/transport/ub/ub_transport.cpp)、[Workers](../../mooncake-transfer-engine/tent/src/transport/ub/workers.cpp)、[Endpoint](../../mooncake-transfer-engine/tent/src/transport/ub/endpoint.cpp)、[UrmaAdapter](../../mooncake-transfer-engine/tent/src/transport/ub/urma_adapter.cpp)、[参数](../../mooncake-transfer-engine/tent/include/tent/transport/ub/params.h)。
-
-当前不是一个 slice 独占一个 Jetty。多个 WR 可共用同一 Jetty；一个请求的 50 片不必占用 50 个 Jetty。现有默认 6 个 posting worker，若只把每 endpoint 数量改成 50，按 worker_index 取模也不会自动使用全部 50 个。
+| Task/Slice | 每个 TE Request 创建 UbTask，再拆 slice | 保留，不引入 Group |
+| 选路 | Workers 对 PendingSlice 选择本地/远端组合 | 保留逐 slice 路由规则和健康过滤 |
+| 发送 Jetty | endpoint 所有，按 worker_index 取模 | 从选中 Context 池为本次 attempt 独占借用 |
+| 远端目标 | RC Jetty 数组一一绑定 | RM endpoint 发布自身目标，不与 SEND 池数量对应 |
+| 模式 | 真实 adapter 固定 RC，执行 bind | 增加明确的 RM 创建/import/post 分支 |
+| 完成 | token、attempt、Inflight、quota 唯一结算 | 增加 slice lease 和 Task attempt 额度，不另建完成体系 |
+| Seal | UbTask::seal 表示切片集合构造完毕 | 原样保留，不作为 Jetty 归还条件 |
 
 ```mermaid
 flowchart LR
-    subgraph Before["当前：RC / endpoint-owned"]
-        S["各 slice"] --> W["worker 逐片选路"]
-        W --> E["endpoint Jetty 集合"]
-        E --> J["worker_index 取模选 Jetty"]
+    subgraph Current["当前 RC"]
+        S["slice 逐片选路"] --> E["endpoint Jetty 数组"]
+        E --> J["worker_index 取模"]
     end
-    subgraph After["目标：RM / context-owned"]
-        T["Task 有界窗口"] --> R["选路径并建立组"]
-        R --> P["从所选 context 池借一次"]
-        P --> L["该组切片固定使用同一 lane"]
+    subgraph Proposed["目标 RM"]
+        P["slice 逐片选路"] --> Context["确定 Context/EID"]
+        Context --> Pool["借一个空闲 Jetty"]
+        Pool --> Attempt["本次 attempt 独占"]
+        Attempt --> Back["完成后归还"]
     end
 ```
 
-组内固定路径会改变原逐 slice 动态调度粒度。本文保留现有候选、健康和 quota 规则，但不声称调度行为完全不变；以窗口边界限制长期固定和独占。
+当前不是每 slice 独占 Jetty。默认 6 个 worker 和每 endpoint 6 个 Jetty；仅将 jetty_per_endpoint 改成 50，仍按 worker_index 选择，不能形成 Context 池。本方案把容量名额与 worker 编号解耦。
 
-## 4. 公共架构与所有权
+代码依据：[UbTransport](../../mooncake-transfer-engine/tent/src/transport/ub/ub_transport.cpp)、[Workers](../../mooncake-transfer-engine/tent/src/transport/ub/workers.cpp)、[Endpoint](../../mooncake-transfer-engine/tent/src/transport/ub/endpoint.cpp)、[Adapter](../../mooncake-transfer-engine/tent/src/transport/ub/urma_adapter.cpp)、[参数](../../mooncake-transfer-engine/tent/include/tent/transport/ub/params.h)。
 
-| 对象 | owner / 职责 |
+## 4. 状态与所有权
+
+| 对象 | 职责 |
 | --- | --- |
-| UbContext | 持有该 EID/context 的 RmJettyResource、JFC 和原生 context |
-| RmJettyResource（新增） | SEND/共享目标唯一 native owner，预算、成员 registry、创建/退役和补池 |
-| SendJettyPool（新增） | 空闲索引、Acquire/Return/Remove；不发 RPC、不调用 provider |
-| UbJettyLane（新增） | native Jetty、generation、绑定 JFC、PostGate、WR depth 和状态 |
-| UbGroupState / UbLaneLease（新增） | 冻结路径、窗口、生产者计数、pending、归还一次性状态 |
-| UbEndpoint | RM 远端目标、远端 generation、导入缓存和就绪状态；不拥有本地 SEND Jetty |
-| Workers / Inflight | 沿用唯一 token/attempt 完成入口，持有 lane、target、注册与组引用 |
-| UrmaAdapter | 标准 RM 操作及真实 provider 排空契约；RC 原接口继续兼容 |
+| UbContext | 持有该 EID/Context 的 RmJettyResource、JFC 和 native Context |
+| RmJettyResource（新增） | SEND Jetty 唯一 native owner；预算、registry、退役和补池 |
+| SendJettyPool（新增） | 空闲成员、TryAcquire/Return/Remove，不发 RPC、不调用 provider |
+| UbJettyLane / SliceJettyLease（新增） | native 身份、PostGate；一次 attempt 的独占使用权和归还认领 |
+| UbTask | 原逻辑聚合，加 TaskAttemptLimiter；不保存 Context 到 lane 的映射 |
+| PendingSlice / Inflight | 已有 Task/Slice 关联；Inflight 保留 lease、Task permit、target 和注册引用 |
+| UbEndpoint | 自己的 RM 本地目标、remote imported target、连接代际及清理责任 |
+| UrmaAdapter | RM/RC 模式、target import、post 和真实排空/删除契约 |
 
 ```mermaid
 flowchart TD
-    Task["UbTask：逻辑请求"] --> Group["UbGroupState：窗口 / 路径 / 方向"]
-    Route["既有 topology / RailMonitor / quota 规则"] --> Group
-    Group --> Lease["UbLaneLease"]
-    Context["UbContext：设备 + EID + incarnation"] --> Resource["RmJettyResource"]
-    Resource --> Pool["SEND pool"]
-    Resource --> Target["本地共享目标"]
-    Pool --> Lease
-    Endpoint["Endpoint：远端 target 引用"] --> Inflight["既有 Inflight + token + attempt"]
+    Task["UbTask：请求身份 + 在途上限 K"] --> Slice["PendingSlice：task + slice"]
+    Slice --> Route["逐 slice 选路"]
+    Route --> Pool["所选 Context 的 SEND pool"]
+    Pool --> Lease["本次 attempt 独占 lease"]
+    Endpoint["Endpoint：本地目标 / 远端 target"] --> Inflight["既有 Inflight + token + attempt"]
     Lease --> Inflight
-    Inflight --> Done["CQE 唯一结算 / credits / pending"]
-    Done --> Return["Seal 后归还或退役"]
+    Task --> Permit["Task attempt permit"]
+    Permit --> Inflight
+    Inflight --> Settle["唯一结算及 post 返回协调"]
+    Settle --> Release["归还 lease / 释放额度，或安全退役"]
 ```
 
-Pool、Group、Inflight 的锁不包围 metadata/RPC/provider 调用。不同 worker 可以处理同组切片，但只从 Group 读取同一 lease，并通过 lane PostGate 和 adapter 的线程安全契约协调 post，不能因 worker 不同而改选 Jetty。
+每个 TE Request 对应一个 Task；一次 Store GET/PUT 或 batch 可能包含多个 TE Request。现有 PendingSlice 带 UbTask::Ptr，UbSlice 内部保留父 Task 弱引用；slice_id 只在 Task 内唯一。TaskAttemptLimiter 直接附属 Task，用现有对象关联，不用 slice_id 充当全局请求 ID。
 
-共享目标与发送 lane 是软件角色，底层仍用标准 Jetty API。JFR/JFC 的共享属性和接收资源按物理 provider 配置，不假设单边请求不需要这些 native 资源。
+资源、Task、endpoint 和 Inflight 各自锁不包围 metadata/RPC/provider 调用。正常资源借还只修改容器状态；native 创建/删除留在受预算控制的准备或后台路径。
 
-## 5. RM 原生能力与握手改造
+## 5. RM 能力与 endpoint 目标协议
 
-当前 RealJetty::remote 和 BOUND 状态围绕 RC 绑定构建。RM 不能只是将 trans_mode 常量改成 RM：
+现有 RealJetty 的 BOUND 状态及 remote 成员是 RC 模型。RM 必须拆开本地发送句柄与远端目标：
 
-1. 在 Context/JFR/Jetty 创建参数中显式携带模式，并确认 provider 支持实际 RM READ/WRITE。
-2. 将 remote target 作为独立导入句柄和引用，不固定存成发送 Jetty 唯一远端。
-3. RM post 接收本组 target，逐 WR 设置对应原生 tjetty；local/remote Segment 必须与 context 和目标兼容。
-4. RC bind/unbind 保留为独立分支；RM 就绪条件不再是“RC 已绑定”。
-5. 一个健康 SEND lane 可在前组完成归还后顺序访问不同 target，首版不在不同 lease 之间并发共用。
-
-握手增加独立版本/能力，例如 `pooled_rm_v1`，交换 context incarnation、完整目标 EID/UASID/ID、target_epoch、注册/协议兼容信息。发送池数量是本地预算，不要求对端有 50 个目标。
+1. Context/JFR/Jetty 参数明确携带模式，真实 provider 验证 RM READ/WRITE。
+2. endpoint 为相应本地 Context 和 peer 连接准备自己的 RM 目标，握手公布完整 EID/UASID/Jetty ID、context/endpoint incarnation、target_epoch 和注册兼容信息。
+3. remote target 作为独立引用导入；post 接收本次 slice 的 target，逐 WR 设置 tjetty，不依赖发送 Jetty 的固定 RC remote。
+4. 不执行 RC bind；不同 slice 在先后归还后，可用同一 SEND Jetty 顺序访问不同 endpoint target。
+5. 保留 RC 独立分支与旧握手，不混用 native 资源和描述符。
 
 ```mermaid
 sequenceDiagram
-    participant A as 节点 A Context / Pool
-    participant E as A 到 B 的 Endpoint
-    participant B as 节点 B 共享目标
-    A->>A: 创建本地 SEND 池及本地共享目标
-    E->>B: 协商 pooled_rm_v1 / 模式 / 身份
-    B-->>E: B 的共享目标及 epoch
-    E->>E: 导入 B target，持有完整身份
-    A->>E: 传输组取得 target 引用
-    Note over A,B: 不公布每个 SEND lane，不执行 RC 一一绑定
+    participant P as A Context SEND pool
+    participant A as A 到 B 的 RM endpoint
+    participant B as B 对应的 RM endpoint
+    P->>P: 创建受预算约束的 SEND Jetty
+    A->>B: 协商 RM slice-pool 能力、模式、身份
+    B->>B: 准备本连接的目标 Jetty
+    B-->>A: 返回 target 身份和 epoch
+    A->>A: 导入 remote target，缓存连接引用
+    Note over P,B: 不创建全 Context 共享目标，不要求双方 SEND 数量一致
 ```
 
-首个 WR 前完成协商。旧 peer 或 RM 能力不满足时，只能在零 WR、未持有数据责任时选择明确支持的 legacy RC 路径；不满足则报错。已 post 后不能自动切协议或重放。RC 和 RM 资源不能混池，双方模式必须一致。
+endpoint target 可服务同连接多个 slice，其生命周期与每个发送 lease 分开，不因一次归还而 unimport。目标创建数量按 endpoint 数增长，这是取消全 Context 共享目标的明确成本。
 
-## 6. 分组与选路：先路径，后 lane
+新能力应使用能区分旧“共享目标/组 lease”含义的协议标识，不能只复用同名能力却改变语义。首个 WR 前协商；不支持时只在零 WR 阶段选择明确支持的 legacy RC 路径，或返回不支持。已接受 WR 后不切协议、不重放。
 
-推荐组键：
+## 6. 逐 slice 准入与单请求上限
 
-```text
-(task identity, window sequence,
- local context incarnation,
- remote context/target identity + target epoch,
- direction)
-```
+每个 Task 在所有 EID、所有 worker 上合计最多 K 个已准入 attempt。计数从实际发送准备阶段获取 permit 开始，覆盖同步 post、已接受 WR 及安全清理，不仅统计逻辑未完成 slice。
 
-| 请求情况 | 分组与 lane |
-| --- | --- |
-| 一请求 50 片，同 context、同 target、同方向且窗口容纳 | 一个组借一个 Jetty，50 片消耗 WR credits |
-| 一请求分别选择两个 EID | 至少两个组，各借对应 context 的一个 Jetty |
-| 一个 batch 有多个 peer | 分别建组；不共享一个全局 batch lane |
-| 长请求有多个窗口 | 每个窗口独立 Seal/收敛/归还，再竞争下一窗口 |
-| 同组出现连接/target 代际变化 | 旧组停止，保留旧责任；合法后续工作使用新组 |
+单次流程：
 
-窗口按最大切片数/字节数给出显式上限，参数在实现和实机验证时确定，不虚构已存在配置。实际每轮提交量还受单 lane 深度、JFC 和路径/设备 quota 限制，窗口不是一次性无限提交许可。
+1. 检查取消、deadline、节点/路径可用性，沿现有规则获取或准备候选 endpoint，确认注册范围。慢握手/导入不持有发送 lease。
+2. 按 slice 候选选路径并非阻塞取得 Task permit、路径/设备 quota、JFC/lane 必需额度。选路与 quota 若仍使用当前组合接口，后续失败须归还它已产生的预留。
+3. 确定 Context 后 TryAcquire 一个 Jetty；全部必要预留可用才提交。任一失败立即回滚全部已取得且未 post 的责任，不持有部分额度等其他资源。
+4. 原子确认取消与提交边界，创建 attempt/token/Inflight，并持有 target/注册和实际 buffer 责任，取得 PostPermit 后调用 provider。
+5. 根据接受结果与真实完成唯一结算，再归还 Jetty 和额度。
 
-路径选择沿用当前合法性、topology rank、RailMonitor 和 quota 优先规则。用窗口内代表范围提出候选后，必须检查组内所有范围的注册/可达性；跨缓冲区或能力边界应拆组，不能只验证第一片。
+预留为非阻塞操作，具体顺序统一并有对应回滚。没有 Group、多组原子预留、请求固定 EID 或整 batch 的资源原子性。
 
-路径确定后从对应 context 池 Acquire，租约覆盖组内窗口推进。池空不等于路径故障，不为获得 lane 自动改变 EID；通过有界排队、取消和请求 deadline 结束等待。新窗口可重新选路，不在每个 slice 上重新抢占路径。
+Task 上限或池不足时走有界延后/唤醒和 deadline，不新建临时 Jetty、不消耗硬件故障重试预算。池空不记为 rail 故障；后续未 post 的重新调度仍沿原 slice 选路规则，不因一个 slice 改变其他 slice 路径。
 
-一个窗口涉及多个组时，try-acquire 全部所需 lane；任一不足立即归还已取得但未 post 的 lease，不能部分持有并等待。窗口的同时需求必须能装入配置预算，超出时先拆小；其他独立 task 不要求整个 batch 原子预留。
+K 是新增配置契约，不是当前已有参数。应大于零，结合单池及设备资源确定；例如池 50、K=4 可防止一个 Task 在该池同时独占 50 个发送 Jetty。该限制只约束单个 TE Task，不能保证应用拆成多个 Task 后仍只有 K 个，也不能替代全局公平策略。
 
-## 7. 借用、提交、封口与归还
+## 7. 借用和归还时序
 
 ```mermaid
 sequenceDiagram
-    participant T as Task / 窗口 owner
-    participant G as GroupState
-    participant P as 所选 Context 的池
-    participant W as Posting workers
-    participant C as CQE / Inflight
-    T->>G: 冻结组路径、范围和目标引用
-    G->>P: TryAcquire 一次
-    P-->>G: Jetty J7 + lease generation
-    T->>W: 发布该组 slices 与 Group 引用
-    loop 有额度且仍允许提交
-        W->>G: 获取固定 lane 及 post 许可
-        W->>C: 先安装 token / Inflight / credits
-        W->>W: 向 J7 post，明确 accepted prefix
-        C->>G: 早到或正常 CQE 唯一结算 pending
-    end
-    T->>G: 所有生产者结束，Seal lease
-    G->>G: 等待 pending=0、active posts=0
-    alt lane 健康且 pool 开放
-        G->>P: 一次归还 J7
-    else lane 故障或 context 正在关闭
-        G->>P: 请求安全退役，不重新发布
+    participant W as Posting worker
+    participant T as TaskAttemptLimiter
+    participant P as 所选 Context 发送池
+    participant I as Inflight / 完成处理
+    participant U as URMA provider
+    W->>W: 为当前 slice 选路径，确认 Context 和 target
+    W->>T: TryAcquire 一个 attempt permit
+    T-->>W: 成功
+    W->>P: TryAcquire 一个空闲 Jetty
+    alt 池空或其他额度不足
+        P-->>W: 无可用资源
+        W->>T: 归还未 post permit，并回滚其他预留
+        W->>W: 有界延后，等待完成唤醒或 deadline
+    else 所有资源准备完成
+        P-->>W: lease(J7, generation)
+        W->>I: 安装 token、lease、target、注册、quota 和 permit
+        W->>U: PostPermit 内调用 post
+        par 提交结果
+            U-->>W: 返回接受结果
+            W->>I: 记录接受状态及同步调用退出
+        and 早到或正常完成
+            U-->>I: CQE 或可信 drain 记录
+            I->>I: 按 token/attempt 唯一确认硬件终结
+        end
+        I->>I: 接受责任明确、硬件终结、active post=0
+        alt Jetty 健康且池开放
+            I->>P: 一次归还 J7
+        else 资源需退役
+            I->>P: 撤下并安全退役，不放回空闲池
+        end
+        I->>T: 一次释放 permit，唤醒待调度 slice
     end
 ```
 
-**两个 Seal 必须分开：**
-
-| 操作 | 当前/拟新增含义 | 时点 |
-| --- | --- | --- |
-| UbTask::seal() | 当前逻辑 slice 集合构造完成，允许完成聚合 | 当前在入队前执行，继续保留 |
-| UbLaneLease::Seal() | 不再生成该组的新提交、重试或窗口工作 | 所有组生产者退出、未 post 后缀处理完成后 |
-
-不能拿 UbTask 已 seal、一次 submit 返回或队列暂时为空作为 lane 可归还证据。记录 producer count、sealed、pending_wrs、active_post_calls、retire_requested、settled。
-
-归还条件：
+正常归还条件：
 
 ```text
-producer_count == 0 && sealed
-&& pending_wrs == 0 && active_post_calls == 0
-&& lane ACTIVE && !retire_requested && pool OPEN
-&& settlement_claimed_once
+acceptance_resolved
+&& all_accepted_or_possibly_accepted_wrs_terminal
+&& active_post_calls == 0
+&& lane ACTIVE && pool OPEN && !retire_requested
+&& return_claimed_once
 ```
 
-一次 lease 只归还一次，归还与 retire 通过同一锁/原子线性化；先退役不能再发布，先归还则退役必须从空闲集合撤下。生产者、post 返回与 CQE 可任意交错，不依赖图中的固定先后。
+确定零 WR 被接受时，仍需 post 退出且资源健康，才可直接归还。接受结果不明时保留责任并退役；CQE 与 post 返回必须共同驱动同一个完成门，不能发布逻辑完成后仍无保护地访问 Inflight。
 
-## 8. 三层容量与例子
+UbTask::seal 仍只表示切片集合已构造。此方案没有 lease 生产者 Seal：一次 attempt 的提交范围在 post 前明确，归还取决于该 attempt 的接受和硬件终结事实，不等待整个 Task 完成。
 
-| 约束 | 管理内容 | 不足时 |
+## 8. 容量、排队与算例
+
+| 额度 | 作用 | 释放时机 |
 | --- | --- | --- |
-| Pool lane 名额 | 同 context 同时独占使用的组数 | 入队/背压，不按每 slice 借 lane |
-| Lane WR credits | 该 Jetty 真实在途 WR + 正在 post 的预留 | 当前组等完成后推进窗口 |
-| JFC / device / path quota | 完成队列、现有设备/路径在途字节与 WR | 保留既有 quota 规则，不放大额度 |
+| Task attempt permit | 限制一个请求合计占用的发送准备/硬件责任 | 未接受回滚，或已接受责任安全结束且同步 post 退出 |
+| Pool lease | 同 Context 一个 slice attempt 独占一个发送 Jetty | 安全归还；坏资源只撤下并进入退役 |
+| Lane/JFC credits | 限制真实 native 队列和完成责任 | 确定未接受或真实终结，恰好一次 |
+| device/path quota | 保留当前在途 WR/字节上限和选路依据 | 对应 attempt 责任结算，幂等归还 |
 
-所有预留采用非阻塞 try-acquire 和确定的回滚路径。只有确定未接受或真实完成才归还 WR credits，不能按队列出队数扣减。等待 quota 时不持有状态锁或同步 provider 调用。
+当前 worker 通常每 slice 提交一条 WR，因此每次 lease 通常只消耗一条 WR 的深度。即使 Jetty depth=256，本方案也不把其他 slice 填到同一已借 lane。这牺牲队列利用率，换取简单的独占模型；若吞吐不足，应评估该取舍，不能悄悄恢复 slice 共用。
 
-例如一个组 50 片，lane 深度 16，且其他额度充足：
+例如一个 Task 有 50 片，均选同一 Context，池容量 50、K=4：
 
 ```mermaid
 flowchart LR
-    G["组 G：50 片，独占 J7"] --> P0["最多 16 WR 在途"]
-    P0 --> CQ["CQE 释放 credits"]
-    CQ --> P1["持续补交剩余切片"]
-    P1 --> Last["生产者结束并 Seal"]
-    Last --> Done["最后 WR 终结后归还 J7"]
+    Q["待处理 50 片"] --> First["最多 4 个 attempt 各借一个 Jetty"]
+    First --> CQ["某片硬件终结且 post 退出"]
+    CQ --> Return["归还 Jetty 与 Task permit"]
+    Return --> Next["再准入下一片"]
+    Next --> First
 ```
 
-这是一个 lane 的队列流水，不需要 50 个 Jetty。50 个池成员代表最多 50 个独占租约；一请求多组会占多个租约，不能称为固定支持 50 个请求。大窗口可能增加独占时间，需要通过窗口上限和现有优先队列验证公平性，不新增跨 peer 配额系统。
+这个请求最多同时占 4 个发送 Jetty，不是 1 个，也不是 50 个；后续 slice 可借到相同或其他空闲成员。若选择不同 EID，合计仍受同一个 K 约束。
 
-设备级总预算包含 SEND、共享目标、RC legacy、retiring/quarantine、creating 和其他相关资源；JFC 深度按绑定到该 JFC 的实际在途责任核算，不能把 50 乘以 lane depth 直接当成可用总额度。
+四个池各 50 不代表只能或必然支持 200 个 Task；容量由活跃 attempt、endpoint 目标、JFC/设备 quota 和原生上限共同决定。多个 Task 仍可能同时打满池，需保留有界队列、现有优先级和公平性验收，不额外建立跨 peer 调度系统。
 
-## 9. 完成身份、partial post 与故障收敛
+## 9. 完成、失败与重试
 
-复用当前 UbCompletionToken、UbAttemptToken 和 Workers::Inflight 的唯一入口，新增组/lane generation、target 与注册强引用。不得另建与现有 inflight 平行的业务完成 registry。
+复用 UbCompletionToken、UbAttemptToken 和 Workers::Inflight。每次重试建立新 attempt 身份，新旧责任不能共用同一 lease 状态；slice_id 只在 Task 内唯一，不能作为全局 native token。
 
-每 WR 先安装完成记录并预留 credits，再进入 provider。明确区分 accepted 结果和 CQE 到达，允许 CQE 早于 post 返回。最终 lane 归还还要求同步调用退出，不能提前回收 post 使用的描述内存。
-
-| 结果 | 处理 |
+| provider/完成结果 | 处理 |
 | --- | --- |
-| 全部接受 | 等待真实 CQE，按 token/attempt 唯一结算 |
-| 可信 posted_count / bad_wr 前缀 | 保留已接受前缀，只取消确定未接受后缀 |
-| 接受范围不明 | 保留可能接受责任，封闭组并退役，不包装为整体可重试 |
-| 特殊 flush/done、未知或重复 token | 先按类型分类，不能当成新业务 WR 重复扣减 |
+| 成功接受 | 保留 lease/permit/注册，等待真实终结 |
+| 确定零接受 | 回滚对应额度；健康 Jetty 归还，否则退役 |
+| 可信 accepted prefix | 前缀保留，确定未接受后缀取消；若一 slice 将来对应多 WR，全部责任终结后才归还该 lease |
+| 接受范围不明 | 保留所有可能责任、停止该 attempt，进入安全退役 |
+| 重复/迟到 CQE、未知 token | 不重复完成、归还或扣减 |
+| flush/done 等控制记录 | 先分类，不作为新的业务完成直接解引用 user_ctx |
 
-READ 失败内容不交付业务；重试前确保旧 WR 不再写同一缓冲，注册与 lease 仍有效。WRITE 可能已接受时报告相应失败/结果未知，不盲目沿用当前一般重试预算重放整个组。安全重试必须由明确的未接受事实或上层重放契约支持。
+Jetty 有可信终结 CQE 且资源仍健康时，失败操作也可安全归还；失败结果不自动等于 Jetty 故障。资源确实不可用时才退役。
+
+READ 失败内容无效，重读前旧 WR 不得继续写同一 buffer，注册和访问契约仍须有效。WRITE 可能已接受时保留结果不确定性，不盲目沿用一般重试预算重放。仅明确未接受或上层提供安全重放契约时才重试；重试重新取得 Task permit、路径额度和 lease。
+
+逻辑 timeout/cancel 不提前释放已接受责任。未 post 且提交边界确认取消时立即回滚；post 中或已 post 则等真实 CQE/drain。物理未终结的超时 attempt 继续占 Task permit，不能靠逻辑重试绕过 K。
+
+## 10. 资源退役、endpoint 目标与退出
 
 ```mermaid
 stateDiagram-v2
     [*] --> CREATING
     CREATING --> IDLE: 创建并发布
-    IDLE --> LEASED: Acquire
-    LEASED --> IDLE: Seal 且责任收敛且资源健康
+    IDLE --> LEASED: 一个 slice attempt 借用
+    LEASED --> IDLE: 接受明确、责任终结、post 退出且健康
     IDLE --> QUIESCING: 撤下并关闭 PostGate
-    LEASED --> QUIESCING: 故障或退出，禁止新 post
+    LEASED --> QUIESCING: 资源故障或退出
     QUIESCING --> DRAINING: 同步 post 全部退出
     DRAINING --> DESTROYED: DMA 和事件排空后安全删除
-    DRAINING --> QUARANTINED: 证据缺失或清理失败
+    DRAINING --> QUARANTINED: 缺少屏障或清理失败
 ```
 
-池成员故障只退役该资源和受影响组，不因一个 lane 故障关闭整个 EID 池；确认 context/JFC 故障时按对应域关闭。健康恢复不复活旧 lane，补池创建新身份。
+一个 lane 故障只影响其 attempt 和资源，不直接关闭整个 EID 池。Context/JFC 故障按对应域停止新借用。节点恢复不复活退役 Jetty，补池创建新 identity，静态总预算包括退役、quarantine 和创建中责任。
 
-物理 provider 必须提供可信 quiesce 屏障。沿用当前 quiesceJetty 的无后续发送 DMA 契约并验证 RM，不能推导它必然排空共享目标的所有入站访问。delete 非零后的句柄是否保留，也须按实际 provider 明确，不能从 bonding wrapper 推断。
+补池在锁外创建、发布前复查 stopping/代际；资源不足不无限扩建。delete 失败后的句柄有效性必须按物理 provider 明确；只有确认 retained 且允许重试才再次调用，consumed/unknown 不解引用旧指针。未排空的事件和 native ID 归属继续保留，不能让迟到事件命中新资源。
 
-## 10. endpoint、共享目标与退出
+endpoint 持有本连接的本地目标和导入远端 target，目标退役更新 epoch。缓存移除只撤销可发现性；已 post Inflight 继续持有 target/segment 引用，安全后后台 unimport/delete。不能让 endpoint::quiesce 遍历并 reset 属于 Context 池、可能服务其他 peer 的发送 Jetty。
 
-RM endpoint eviction 只撤销远端连接可发现性；持有 target/segment 的组和 Inflight 继续存活，引用排空后后台 unimport。当前 endpoint::quiesce 遍历自身发送 Jetty 的逻辑不能直接用于 RM：endpoint 不再拥有池成员，不得顺带 reset 正服务其他 peer 的 lane。
-
-本地共享目标由 context resource 唯一拥有。目标故障更新 target_epoch 并撤下旧身份，远端刷新握手/import；已 post 责任保留旧引用。注销注册前必须确认入站 DMA 不再发生，不能只检查本地 SEND pending=0。
+目标不在 Context 范围共享，不等于其入站 DMA 已可枚举。销毁 endpoint 目标或注销内存前仍需 provider 停止新访问并排空入站的屏障，不能只看本地 SEND pending=0。当前 quiesceJetty 的发送 DMA 契约须验证 RM，不能直接推导入站保证。
 
 ```mermaid
 sequenceDiagram
     participant S as Shutdown owner
-    participant P as Resource / Pool
-    participant W as Workers / Groups
+    participant P as Context 发送池
+    participant W as Workers / Inflight
+    participant E as Endpoints / Targets
     participant C as CQE / Adapter
-    participant B as Buffer / Context
-    S->>P: 关闭 Acquire、握手、import 和 refill 发布
-    S->>W: 停未 post 生产者，封口现有 lease
-    W->>C: 等同步 post 退出，持续完成及 quiesce
-    C-->>P: 唯一结算并确认安全排空
-    P->>P: 安全停止共享目标入站访问
-    P->>B: 无硬件访问后释放 target/注册/实际缓冲
-    S->>B: 最后释放 JFR、JFC、Context/runtime
-    Note over P,B: 任何屏障未确认则保留依赖并报告待清理，不提前释放
+    S->>P: 关闭新借用和补池发布
+    S->>W: 停新调度，取消未 post 队列并回滚预留
+    S->>E: 关闭新握手/import/目标访问准入
+    W->>C: 等 post 退出，继续 CQE 与可信 quiesce
+    C-->>W: 所有接受责任唯一终结
+    W->>P: 归还或退役 lease
+    E->>C: 排空目标入站，清理 target/注册依赖
+    S->>S: 实际缓冲安全后，最后释放 JFR/JFC/Context/runtime
+    Note over S,C: 屏障不明则保留依赖并报告待清理，不用固定超时强制释放
 ```
 
-Store/调用方仍须保留实际用户内存，token/MR 引用不等于保留原始 buffer。逻辑 timeout、取消与可释放许可分离；现有 TENT 对外完成、缓冲责任若不足，先补生命周期接入，不能靠 lane pool 隐藏风险。完成线程不能等待必须由自身消费的事件。
+token/MR 引用不能阻止调用者释放实际 buffer；现有对外超时与清理契约若不足，先落实实际 buffer owner。发布逻辑结果、释放 lease 与可释放用户内存是不同事件，不能互相代替。
 
-补池使用静态目标和有限额外退役窗口，锁外创建、锁内复查 stopping/代际后发布。不能靠不断补池掩盖 quarantine，预算耗尽产生背压。
+## 11. 最新 TENT 的接入点
 
-## 11. 最新 TENT 的具体修改位置
-
-| 文件/模块 | 改动 |
+| 文件/模块 | 修改职责 |
 | --- | --- |
-| [context.h / context.cpp](../../mooncake-transfer-engine/tent/include/tent/transport/ub/context.h) | 持有 context 发送池、共享目标和代际；保持已有故障状态与 JFC 生命周期 |
-| RmJettyResource / SendJettyPool / UbLaneLease（拟新增） | 静态预算、Acquire/Return、组生产者、lane credits、退役和补池 |
-| [slice.h](../../mooncake-transfer-engine/tent/include/tent/transport/ub/slice.h) | Task 保留原 seal，切片关联 Group；重试不能丢失旧 attempt 责任 |
-| [workers.cpp](../../mooncake-transfer-engine/tent/src/transport/ub/workers.cpp) | 从逐片任意选路改为组/窗口固定；删除 RM 的 worker_index 选 Jetty；Inflight 持 lane 引用 |
-| [endpoint.h / endpoint.cpp](../../mooncake-transfer-engine/tent/include/tent/transport/ub/endpoint.h) | RM 只管理远端目标/身份，拆分 RC 绑定与 RM 导入，调整 eviction/quiesce |
-| [urma_adapter.h / .cpp](../../mooncake-transfer-engine/tent/include/tent/transport/ub/urma_adapter.h) | 模式能力、RM create/import/post、独立 target 句柄、RM drain/delete 契约 |
-| [ub_transport.cpp](../../mooncake-transfer-engine/tent/src/transport/ub/ub_transport.cpp) | 安装资源、握手能力、组 owner 与 shutdown；资源不在每请求热路径创建 |
-| [quota.cpp](../../mooncake-transfer-engine/tent/src/transport/ub/quota.cpp) / JFC | 复用 quota 算法，衔接 lane/JFC credits 及幂等回滚，避免重复/遗漏统计 |
-| [params.h](../../mooncake-transfer-engine/tent/include/tent/transport/ub/params.h) / tests | 显式 RM 开关、每 context 池目标和窗口上限；50 不写成未经验证默认值 |
+| [context.h](../../mooncake-transfer-engine/tent/include/tent/transport/ub/context.h) / context.cpp | 持有该 EID/Context 的发送资源 owner，核对设备级总上限 |
+| RmJettyResource / SendJettyPool / SliceJettyLease（新增） | 独占借还、代际、PostGate、预算和安全退役，不增加 Group 类型 |
+| [slice.h](../../mooncake-transfer-engine/tent/include/tent/transport/ub/slice.h) | Task 内新增原子/锁保护的 attempt 上限，保留原 seal/聚合语义 |
+| [workers.cpp](../../mooncake-transfer-engine/tent/src/transport/ub/workers.cpp) | 保留逐 slice 选路；Task/quota/池预留协调；Inflight 持 lease 和 permit，唯一释放并唤醒 |
+| [endpoint.h](../../mooncake-transfer-engine/tent/include/tent/transport/ub/endpoint.h) / endpoint.cpp | 连接级 RM 目标和 remote target，拆分 RC bind 与 RM import，调整回收范围 |
+| [urma_adapter.h](../../mooncake-transfer-engine/tent/include/tent/transport/ub/urma_adapter.h) / .cpp | 模式能力、独立 target、RM post、accepted 范围、drain/delete 契约 |
+| [ub_transport.cpp](../../mooncake-transfer-engine/tent/src/transport/ub/ub_transport.cpp) | 安装池、协议协商、Task 初始化与 shutdown；不引入请求窗口规划 |
+| [quota.cpp](../../mooncake-transfer-engine/tent/src/transport/ub/quota.cpp) / JFC | 复用现有配额，衔接额度回滚，不重复统计硬件责任 |
+| [params.h](../../mooncake-transfer-engine/tent/include/tent/transport/ub/params.h) / tests | 显式 RM 开关、每 Context 池目标、Task 在途上限 K 和有界等待；名称/默认值待落地 |
 
-可与组件化设计共用这些实现，但本方案不以抽出独立 UbEngine/SDK 为前提，不复制两份 UB 数据面。健康模块提供硬准入，池只执行结果；时延上报使用完成值，不把池等待、Jetty 空闲数或队列转换成新的节点权重。
+健康模块仍决定节点和路径准入，池不制造端口故障；时延模型只消费合格完成样本，不把池空闲数或等待计入新调度权重。实现可以服务未来独立 UbEngine，但不要求先抽 SDK，不复制两套 UB 数据面。
 
-## 12. 实施与验收
+## 12. 实施和验收
 
-实施按依赖推进：
+实施顺序：验证物理 RM 及端点目标能力 → 模式/握手与独立 target → Context 池和 attempt lease → Task K 与原 quota/完成衔接 → 超时、故障、兼容和实机验收。RC 在功能关闭时保持原行为；未验证 RM 则不启用。
 
-1. 验证物理 RM 单 Jetty 顺序访问不同 target、READ/WRITE、完整身份及安全排空；不满足则保持 RC。
-2. 实现模式分支和版本化 RM 目标握手，RC 原路径保持；关闭池化时不改变 RC 行为。
-3. 接入 context owner、静态池和 lane credits，复用既有完成路径。
-4. 实现窗口/组、固定路径和 lease 生产者封口，完成背压、取消、重试与故障退出。
-5. 单/多 EID、多 peer 及真实故障验收后启用 RM；记录与当前逐片选路的性能和公平差异。
-
-| 验收场景 | 必须证明 |
+| 场景 | 必须证明 |
 | --- | --- |
-| 4 个 EID/context，各配 50 | 200 个 SEND 池成员，目标/退役等另计；共享物理设备预算不越界 |
-| 50 片同组 | Acquire 一次，使用同一个 lane，不消耗 50 个 lease |
-| 一个请求跨两个 EID/多个目标 | 正确分组，不把跨 context 注册和 lane 混用 |
-| lane depth=16、50 片 | 以不超过额度的队列流水完成，无额外 lane 借用 |
-| 超大 task、多优先级、小请求 | 有界窗口释放竞争，验证长请求不会无限占用 |
-| worker_count=6、pool=50 | 获取实际空闲成员，不再固定只有前 6 个可选；活跃数由组并发决定 |
-| 空池、quota/JFC 满、多组预留失败 | 有界背压、预留回滚，无持有部分 lane 等待死锁 |
-| Task seal 早于 post、CQE 早于 post 返回 | 不误作 lease 封口，不提前归还 |
-| partial post、重复/迟到 token、特殊完成 | 不重复结算，不释放可能接受责任 |
-| WRITE 结果未知、READ 重试 | 不整体重放不确定写，旧 READ 不与新操作争写缓冲 |
-| endpoint eviction / peer 重启 | 不删除其他组正在使用的池 Jetty，旧 target 引用正确收敛 |
-| lane/context/JFC/共享目标故障 | 故障域准确，安全排空后才释放，恢复不复活旧身份 |
-| shutdown/refill/timeout 并发 | native、buffer、注册和 context 依赖有界保留，无提前释放 |
-| RM/RC、旧 peer、不同池大小 | 首个 WR 前协商；RM 不要求两端 SEND 数量匹配 |
+| 四 EID 各配 50 | 200 个 SEND 正常成员，endpoint 目标等另计，共享设备预算不越界 |
+| 50 片、单 Context、K=4 | 同 Task 合计最多 4 个准入 attempt，各自独占；完成释放后继续 |
+| 同 Task 跨 EID、并发 worker | K 原子生效，合计不超限，不按 slice_id 混淆 Task |
+| 一个 Jetty depth 大于 1 | 首版仍只租给一个 attempt，不暗中并发混入其他 slice |
+| 多 Task、多优先级 | 单 Task 不无限占池，等待和队列有界，明确不承诺应用级全局公平 |
+| worker_count=6、pool=50 | 空闲池选择不由 worker_index 固定，活跃资源取决于准入 attempt |
+| 池空、quota 满、握手失败、提交前取消 | 没有硬件接受时全部预留准确回滚，等待不耗故障重试预算 |
+| Task seal、CQE 早到、post 尚未返回 | 不提前归还或发布后访问已释放记录 |
+| 零接受、partial/模糊接受、重复 token | 确定后缀回滚，可能接受责任保留，一次归还 |
+| timeout 后物理仍在途 | lease/permit/实际缓冲保留，新 attempt 不能绕过 K |
+| WRITE 结果未知、READ 重试 | 不盲目重放，不与旧操作争写同一缓冲 |
+| endpoint eviction、目标换代、peer 重启 | 不清理其他 endpoint 的 lane，旧 target 引用正确收敛 |
+| lane/Context/JFC 故障及补池 | 故障域明确、身份不复活，native 总量有界 |
+| shutdown 与 post/CQE/refill 并发 | 无屏障不释放 native、注册、buffer 或 Context |
+| RM/RC、旧 peer、两端池大小不同 | 零 WR 阶段确定协议，RM 无 SEND 一一匹配要求 |
 
-UT 用 fake adapter、可控完成和确定性线程交错验证状态机；integration 覆盖 Task 到组、握手和唯一结算；ST 使用真实物理 UB 验证 RM 复用与屏障。mock 不证明驱动 DMA 安全。此处列的是待执行验收，不是当前测试结果。
+UT 使用可控 adapter/clock/线程交错验证状态机；integration 验证 Task 来源、协议和唯一结算；ST 验证真实物理 RM、端点目标入站屏障与并发性能。此处均为待执行计划，不是已完成测试结果。
 
-指标包括每 context idle/leased、每组 Acquire 次数、lane/JFC 在途、retiring/quarantine、背压时间、窗口等待、创建次数、吞吐和 p99。50 个 Jetty 是资源预算示例，最终容量由并发、硬件额度和实测决定，不以扩大池替代生命周期正确性。
+重点指标：每 Task 准入 attempt、每 Context idle/leased、借还次数、回滚/等待、endpoint 目标数量、retiring/quarantine、吞吐和 p99。相比上一版，增加了每 slice 借还开销并减少单 Jetty 队列利用率，换取与逐 slice 路由一致、无需 Group/Seal 的简单模型。
