@@ -10,6 +10,8 @@
 
 > 后续综合方案：[TENT 物理 UB RM 通信组件一体化设计](tent-ub-rm-integrated-design.md)。TENT RM 首版以该文为准，仅采用专用 post/poll 线程池；本文的 Manual progress 不属于首版交付范围。
 
+> 2026-11-02 池化与线程最新约束见 [RM Jetty 池化与线程池管理 V3](tent-ub-rm-jetty-pool-design.md)：节点按口共享 target、故障触发探测、恢复停探、异步删除补池和 LIFO。相关旧目标设计以 V3 为准。
+
 ## 1. 目标与边界
 
 将现有 TENT 原生 UBTransport 的可复用能力抽成独立 UbEngine，使其他应用无需启动完整 TENT runtime，即可使用：
